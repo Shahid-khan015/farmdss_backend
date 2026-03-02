@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.enums import ImplementType
+from app.schemas.common import Timestamped, UUIDResponse
+
+
+class ImplementBase(BaseModel):
+    name: str = Field(min_length=1)
+    manufacturer: Optional[str] = None
+    implement_type: ImplementType
+
+    width: Optional[Decimal] = Field(default=None, ge=0)
+    weight: Optional[Decimal] = Field(default=None, ge=0)
+    cg_distance_from_hitch: Optional[Decimal] = Field(default=None, ge=0)
+    vertical_horizontal_ratio: Optional[Decimal] = Field(default=None, ge=0)
+
+    asae_param_a: Optional[Decimal] = Field(default=None)
+    asae_param_b: Optional[Decimal] = Field(default=None)
+    asae_param_c: Optional[Decimal] = Field(default=None)
+
+
+class ImplementCreate(ImplementBase):
+    pass
+
+
+class ImplementUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(default=None, min_length=1)
+    manufacturer: Optional[str] = None
+    implement_type: Optional[ImplementType] = None
+
+    width: Optional[Decimal] = Field(default=None, ge=0)
+    weight: Optional[Decimal] = Field(default=None, ge=0)
+    cg_distance_from_hitch: Optional[Decimal] = Field(default=None, ge=0)
+    vertical_horizontal_ratio: Optional[Decimal] = Field(default=None, ge=0)
+
+    asae_param_a: Optional[Decimal] = None
+    asae_param_b: Optional[Decimal] = None
+    asae_param_c: Optional[Decimal] = None
+
+
+class ImplementRead(UUIDResponse, Timestamped, ImplementBase):
+    model_config = ConfigDict(from_attributes=True)
+
