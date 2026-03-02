@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import os
+import sys
 from logging.config import fileConfig
+
+# --- FIX FOR RENDER DEPLOYMENT ---
+# This adds the root of your project to the Python path so Alembic can find the 'app' module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ---------------------------------
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
@@ -59,4 +66,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-
