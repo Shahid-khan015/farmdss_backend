@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DECIMAL, Enum, String
+from sqlalchemy import BOOLEAN, DECIMAL, Enum, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -30,6 +30,8 @@ class Implement(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     asae_param_a: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)
     asae_param_b: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)
     asae_param_c: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)
+
+    is_library: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False, index=True)
 
     simulations: Mapped[list["Simulation"]] = relationship(
         back_populates="implement", cascade="all, delete-orphan"

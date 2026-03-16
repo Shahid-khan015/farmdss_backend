@@ -23,6 +23,8 @@ class ImplementBase(BaseModel):
     asae_param_b: Optional[Decimal] = Field(default=None)
     asae_param_c: Optional[Decimal] = Field(default=None)
 
+    is_library: bool = False
+
 
 class ImplementCreate(ImplementBase):
     pass

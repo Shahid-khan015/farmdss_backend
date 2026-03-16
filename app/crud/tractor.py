@@ -27,6 +27,7 @@ class CRUDTractor(CRUDBase[Tractor, TractorCreate, TractorUpdate]):
         q: Optional[str] = None,
         manufacturer: Optional[str] = None,
         drive_mode: Optional[str] = None,
+        is_library: Optional[bool] = None,
         sort: str = "name",
         limit: int = 20,
         offset: int = 0,
@@ -40,6 +41,8 @@ class CRUDTractor(CRUDBase[Tractor, TractorCreate, TractorUpdate]):
             stmt = stmt.where(Tractor.manufacturer == manufacturer)
         if drive_mode:
             stmt = stmt.where(Tractor.drive_mode == drive_mode)
+        if is_library is not None:
+            stmt = stmt.where(Tractor.is_library == is_library)
 
         if sort == "power":
             stmt = stmt.order_by(Tractor.pto_power.desc().nullslast(), Tractor.name.asc())

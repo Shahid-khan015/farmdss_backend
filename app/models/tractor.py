@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DECIMAL, Enum, Integer, String
+from sqlalchemy import BOOLEAN, DECIMAL, Enum, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -37,6 +37,8 @@ class Tractor(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     transmission_efficiency: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # %
     power_reserve: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # %
+
+    is_library: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False, index=True)
 
     tire_specification: Mapped[Optional["TireSpecification"]] = relationship(
         back_populates="tractor", uselist=False, cascade="all, delete-orphan"

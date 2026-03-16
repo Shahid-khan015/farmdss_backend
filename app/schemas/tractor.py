@@ -30,6 +30,8 @@ class TractorBase(BaseModel):
     transmission_efficiency: Optional[Decimal] = Field(default=None, ge=0)
     power_reserve: Optional[Decimal] = Field(default=None, ge=0)
 
+    is_library: bool = False
+
 
 class TractorCreate(TractorBase):
     tire_specification: Optional[TireSpecificationCreate] = None

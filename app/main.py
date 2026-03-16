@@ -7,6 +7,8 @@ from app.api.v1.api import api_router
 from app.config import settings
 from app.database import Base, engine
 from app import models  # noqa: F401
+from app.database import SessionLocal
+from app.utils.seed_library import seed_library_if_empty
 
 
 def create_app() -> FastAPI:
@@ -29,6 +31,14 @@ def create_app() -> FastAPI:
     # Auto-create tables only for SQLite fallback (dev convenience).
     if str(engine.url).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
+
+    @app.on_event("startup")
+    def _seed_library_data():
+        db = SessionLocal()
+        try:
+            seed_library_if_empty(db)
+        finally:
+            db.close()
 
     @app.get("/health")
     def health():

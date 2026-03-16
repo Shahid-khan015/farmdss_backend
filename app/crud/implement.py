@@ -18,6 +18,7 @@ class CRUDImplement(CRUDBase[Implement, ImplementCreate, ImplementUpdate]):
         q: Optional[str] = None,
         implement_type: Optional[str] = None,
         manufacturer: Optional[str] = None,
+        is_library: Optional[bool] = None,
         sort: str = "name",
         limit: int = 20,
         offset: int = 0,
@@ -30,6 +31,8 @@ class CRUDImplement(CRUDBase[Implement, ImplementCreate, ImplementUpdate]):
             stmt = stmt.where(Implement.implement_type == implement_type)
         if manufacturer:
             stmt = stmt.where(Implement.manufacturer == manufacturer)
+        if is_library is not None:
+            stmt = stmt.where(Implement.is_library == is_library)
 
         if sort == "weight":
             stmt = stmt.order_by(Implement.weight.desc().nullslast(), Implement.name.asc())
