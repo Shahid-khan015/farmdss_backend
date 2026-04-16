@@ -10,7 +10,12 @@ from app.api.deps import get_db
 from app.middleware.auth import get_current_user, require_role
 from app.models.operation_charge import OperationCharge
 from app.models.user import User
-from app.schemas.operation_charge import OperationChargeCreate, OperationChargeRead, OperationChargeUpdate
+from app.schemas.operation_charge import (
+    PER_HOUR_OPERATION_TYPES,
+    OperationChargeCreate,
+    OperationChargeRead,
+    OperationChargeUpdate,
+)
 
 router = APIRouter(prefix="/api/v1/operation-charges", tags=["Operation Charges"])
 
@@ -20,11 +25,30 @@ def _to_read(charge: OperationCharge) -> OperationChargeRead:
         id=str(charge.id),
         owner_id=str(charge.owner_id),
         operation_type=charge.operation_type,
-        charge_per_ha=charge.charge_per_ha,
+        charge_per_ha=float(charge.charge_per_ha),
+        charge_per_hour=float(charge.charge_per_hour) if charge.charge_per_hour is not None else None,
         currency=charge.currency,
         created_at=charge.created_at,
         updated_at=charge.updated_at,
     )
+
+
+def _normalize_charge_row(row: OperationCharge) -> None:
+    op = (row.operation_type or "").strip().lower()
+    if op in PER_HOUR_OPERATION_TYPES:
+        if row.charge_per_hour is None or float(row.charge_per_hour) <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Threshing and Grading require a positive charge per hour.",
+            )
+        row.charge_per_ha = 0.0
+    else:
+        if float(row.charge_per_ha) <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Charge per hectare must be positive.",
+            )
+        row.charge_per_hour = None
 
 
 @router.post("", response_model=OperationChargeRead)
@@ -44,11 +68,14 @@ def upsert_operation_charge(
             owner_id=current_user.id,
             operation_type=body.operation_type,
             charge_per_ha=body.charge_per_ha,
+            charge_per_hour=body.charge_per_hour,
         )
         db.add(row)
     else:
         row.charge_per_ha = body.charge_per_ha
+        row.charge_per_hour = body.charge_per_hour
         db.add(row)
+    _normalize_charge_row(row)
     db.commit()
     db.refresh(row)
     return _to_read(row)
@@ -80,7 +107,10 @@ def update_operation_charge(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     if body.charge_per_ha is not None:
         row.charge_per_ha = body.charge_per_ha
+    if body.charge_per_hour is not None:
+        row.charge_per_hour = body.charge_per_hour
     db.add(row)
+    _normalize_charge_row(row)
     db.commit()
     db.refresh(row)
     return _to_read(row)

@@ -50,6 +50,13 @@ def _fmt_distance(metres: Optional[float]) -> str:
     return f"{metres:.0f} m"
 
 
+def _billing_rate_label(operation_type: str) -> str:
+    op = (operation_type or "").strip().lower()
+    if op in ("threshing", "grading"):
+        return "Charge / hour (INR)"
+    return "Charge / ha (INR)"
+
+
 # ---------------------------------------------------------------------------
 # CSV
 # ---------------------------------------------------------------------------
@@ -72,7 +79,7 @@ def build_csv_bytes(report: SessionSummaryReport) -> bytes:
     w.writerow(["Area Covered (ha)", _fmt_float(report.area_ha)])
     w.writerow(["Total Distance", _fmt_distance(report.total_distance_m)])
     w.writerow(["Total Cost (INR)", _fmt_float(report.total_cost_inr)])
-    w.writerow(["Charge / ha (INR)", _fmt_float(report.charge_per_ha_applied)])
+    w.writerow([_billing_rate_label(report.operation_type), _fmt_float(report.charge_per_ha_applied)])
     w.writerow(["Cost Note", report.cost_note or ""])
     w.writerow(["Total Alerts", report.total_alerts])
     w.writerow(["Unacknowledged Alerts", report.unacknowledged_alerts])
@@ -245,7 +252,9 @@ def build_pdf_bytes(report: SessionSummaryReport) -> bytes:
     if report.total_cost_inr is not None:
         overview_data.append(["Total Cost", f"₹ {_fmt_float(report.total_cost_inr)}"])
     if report.charge_per_ha_applied is not None:
-        overview_data.append(["Rate / ha", f"₹ {_fmt_float(report.charge_per_ha_applied)}"])
+        overview_data.append(
+            [_billing_rate_label(report.operation_type).replace(" (INR)", ""), f"₹ {_fmt_float(report.charge_per_ha_applied)}"]
+        )
     if report.cost_note:
         overview_data.append(["Cost Note", report.cost_note])
     overview_data.append(["Total Alerts", str(report.total_alerts)])

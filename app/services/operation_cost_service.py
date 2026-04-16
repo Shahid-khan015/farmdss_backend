@@ -13,6 +13,8 @@ from app.models.tractor import Tractor
 
 logger = logging.getLogger(__name__)
 
+PER_HOUR_OPERATION_TYPES = frozenset({"threshing", "grading"})
+
 
 @dataclass(frozen=True)
 class SessionBilling:
@@ -21,11 +23,22 @@ class SessionBilling:
     cost_note: Optional[str]
 
 
+def _session_duration_hours(session: OperationSession) -> Optional[float]:
+    """Wall-clock hours from started_at to ended_at (session must be completed)."""
+    if session.started_at is None or session.ended_at is None:
+        return None
+    secs = (session.ended_at - session.started_at).total_seconds()
+    if secs < 0:
+        return None
+    return round(secs / 3600.0, 4)
+
+
 def resolve_session_billing(session: OperationSession, db: Session) -> SessionBilling:
     """
-    Per-hectare billing: total = charge_per_ha * area_ha (any positive area, e.g. 0.07 ha).
-    Matches OperationCharge rows set by the owner. Trims whitespace on operation_type for lookup.
-    Does not mutate the session row.
+    Billing from OperationCharge for the tractor owner:
+    - Most operations: total = charge_per_ha × area_ha
+    - Threshing & Grading: total = charge_per_hour × session duration (hours)
+    ``charge_per_ha_applied`` stores the applied rate (Rs/ha or Rs/hr) for API compatibility.
     """
     tractor = db.get(Tractor, session.tractor_id)
     owner_id = session.tractor_owner_id
@@ -51,6 +64,23 @@ def resolve_session_billing(session: OperationSession, db: Session) -> SessionBi
         )
         return SessionBilling(None, None, None)
 
+    op_label = (session.operation_type or "").strip() or (session.operation_type or "Operation")
+
+    if op_key in PER_HOUR_OPERATION_TYPES:
+        hourly = charge.charge_per_hour
+        if hourly is None or float(hourly) <= 0:
+            logger.warning("No hourly rate for owner_id=%s operation_type=%r", owner_id, session.operation_type)
+            return SessionBilling(None, None, "Hourly rate not configured for this operation")
+
+        rate = float(hourly)
+        hours = _session_duration_hours(session)
+        if hours is None:
+            return SessionBilling(None, rate, "Session duration unavailable - cost pending")
+
+        total_cost = round(rate * hours, 2)
+        note = f"{op_label}: Rs {rate}/hr × {hours} h = Rs {total_cost}"
+        return SessionBilling(total_cost, rate, note)
+
     rate = float(charge.charge_per_ha)
 
     if session.area_ha is None:
@@ -62,21 +92,16 @@ def resolve_session_billing(session: OperationSession, db: Session) -> SessionBi
 
     area = float(session.area_ha)
     total_cost = round(rate * area, 2)
-    op_label = (session.operation_type or "").strip() or session.operation_type
-    note = (
-        f"{op_label}: Rs {rate}/ha × {round(area, 4)} ha = Rs {total_cost}"
-    )
+    note = f"{op_label}: Rs {rate}/ha × {round(area, 4)} ha = Rs {total_cost}"
     return SessionBilling(total_cost, rate, note)
 
 
 def compute_session_cost(session: OperationSession, db: Session) -> None:
     """
     Looks up the OperationCharge for this session's owner + operation_type.
-    Requires session.area_ha to already be computed (call after finalize_session_area).
-    Computes total using per-hectare billing:
-        total_cost = rate_per_hectare * area_ha
-    Sets session.total_cost_inr, session.charge_per_ha_applied, session.cost_note.
-    If no charge is found, sets cost fields to None and logs a warning.
+    For area-based ops, uses session.area_ha (after finalize_session_area).
+    For Threshing/Grading, uses session started/ended timestamps.
+    Sets session.total_cost_inr, session.charge_per_ha_applied (applied rate), session.cost_note.
     Does NOT commit - caller commits.
     """
     b = resolve_session_billing(session, db)

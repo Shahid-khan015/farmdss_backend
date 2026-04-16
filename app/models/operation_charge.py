@@ -34,6 +34,7 @@ class OperationCharge(Base):
     )
     operation_type = Column(String(50), nullable=False)
     charge_per_ha = Column(Float, nullable=False)
+    charge_per_hour = Column(Float, nullable=True)
     currency = Column(String(10), nullable=False, server_default=text("'INR'"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

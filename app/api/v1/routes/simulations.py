@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import csv
+import io
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_db
 from app.core.performance_calculator import PerformanceInputs, calculate_performance
@@ -16,11 +21,188 @@ from app.crud.tractor import tractor_crud
 from app.crud.tire_specification import tire_crud
 from app.middleware.auth import get_current_user
 from app.models.enums import SoilTexture
+from app.models.simulation import Simulation
 from app.models.user import User
 from app.schemas.common import DeleteResponse, PaginatedResponse
 from app.schemas.simulation import SimulationRead, SimulationRunRequest
 
 router = APIRouter()
+
+
+def _fmt_decimal(value: Optional[Decimal], precision: int = 2) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):.{precision}f}"
+
+
+def _build_simulation_csv_bytes(
+    sim: SimulationRead,
+    *,
+    tractor_name: str | None = None,
+    implement_name: str | None = None,
+) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    writer.writerow(["SIMULATION REPORT"])
+    writer.writerow([])
+    writer.writerow(["Field", "Value"])
+    writer.writerow(["Simulation ID", str(sim.id)])
+    writer.writerow(["Name", sim.name or ""])
+    writer.writerow(["Created At", sim.created_at.isoformat() if sim.created_at else ""])
+    writer.writerow(["Tractor", tractor_name or str(sim.tractor_id)])
+    writer.writerow(["Implement", implement_name or str(sim.implement_id)])
+    writer.writerow(["Tractor ID", str(sim.tractor_id)])
+    writer.writerow(["Implement ID", str(sim.implement_id)])
+    writer.writerow(["Operation Preset ID", str(sim.operating_conditions_preset_id) if sim.operating_conditions_preset_id else ""])
+    writer.writerow(["Cone Index", _fmt_decimal(sim.cone_index)])
+    writer.writerow(["Depth", _fmt_decimal(sim.depth)])
+    writer.writerow(["Speed", _fmt_decimal(sim.speed)])
+    writer.writerow(["Field Area", _fmt_decimal(sim.field_area)])
+    writer.writerow(["Field Length", _fmt_decimal(sim.field_length)])
+    writer.writerow(["Field Width", _fmt_decimal(sim.field_width)])
+    writer.writerow(["Number of Turns", sim.number_of_turns if sim.number_of_turns is not None else ""])
+    writer.writerow(["Soil Texture", sim.soil_texture or ""])
+    writer.writerow(["Soil Hardness", sim.soil_hardness or ""])
+    writer.writerow(["Draft Force", _fmt_decimal(sim.draft_force)])
+    writer.writerow(["Drawbar Power", _fmt_decimal(sim.drawbar_power)])
+    writer.writerow(["Slip", _fmt_decimal(sim.slip)])
+    writer.writerow(["Traction Efficiency", _fmt_decimal(sim.traction_efficiency)])
+    writer.writerow(["Power Utilization", _fmt_decimal(sim.power_utilization)])
+    writer.writerow(["Field Capacity Theoretical", _fmt_decimal(sim.field_capacity_theoretical)])
+    writer.writerow(["Field Capacity Actual", _fmt_decimal(sim.field_capacity_actual)])
+    writer.writerow(["Field Efficiency", _fmt_decimal(sim.field_efficiency)])
+    writer.writerow(["Fuel Consumption Per Hectare", _fmt_decimal(sim.fuel_consumption_per_hectare)])
+    writer.writerow(["Overall Efficiency", _fmt_decimal(sim.overall_efficiency)])
+    writer.writerow(["Ballast Front Required", _fmt_decimal(sim.ballast_front_required)])
+    writer.writerow(["Ballast Rear Required", _fmt_decimal(sim.ballast_rear_required)])
+    writer.writerow(["Status Message", sim.status_message or ""])
+    writer.writerow(["Recommendations", sim.recommendations or ""])
+
+    if sim.results:
+        writer.writerow([])
+        writer.writerow(["RESULTS"])
+        writer.writerow(["Metric", "Value"])
+        for key, value in sim.results.items():
+            writer.writerow([key, value if value is not None else ""])
+
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def _build_simulation_pdf_bytes(
+    sim: SimulationRead,
+    *,
+    tractor_name: str | None = None,
+    implement_name: str | None = None,
+) -> bytes:
+    try:
+        from reportlab.lib import colors as rl_colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError as exc:
+        raise RuntimeError(
+            "reportlab is required for PDF export. Install it with: pip install reportlab"
+        ) from exc
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        rightMargin=1.5 * cm,
+        leftMargin=1.5 * cm,
+        topMargin=2 * cm,
+        bottomMargin=2 * cm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("SimulationTitle", parent=styles["Title"], fontSize=16, spaceAfter=6)
+    h2_style = ParagraphStyle("SectionHead", parent=styles["Heading2"], fontSize=11, spaceBefore=14, spaceAfter=4)
+    small = ParagraphStyle("Small", parent=styles["Normal"], fontSize=8)
+
+    header_bg = rl_colors.HexColor("#1E6B3C")
+    alt_bg = rl_colors.HexColor("#F4F7F5")
+    border = rl_colors.HexColor("#D6E2DA")
+
+    def table(data: list[list], col_widths=None) -> Table:
+        t = Table(data, colWidths=col_widths, repeatRows=1)
+        t.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), header_bg),
+                ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, alt_bg]),
+                ("GRID", (0, 0), (-1, -1), 0.3, border),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ])
+        )
+        return t
+
+    elements = [
+        Paragraph(f"Simulation Report — {sim.name or str(sim.id)[:8]}", title_style),
+        Paragraph(
+            f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            small,
+        ),
+        Spacer(1, 10),
+        Paragraph("Simulation Overview", h2_style),
+    ]
+
+    page_w = A4[0] - 3 * cm
+    overview = [
+        ["Field", "Value"],
+        ["Simulation ID", str(sim.id)],
+        ["Created At", sim.created_at.isoformat() if sim.created_at else ""],
+        ["Tractor", tractor_name or str(sim.tractor_id)],
+        ["Implement", implement_name or str(sim.implement_id)],
+        ["Tractor ID", str(sim.tractor_id)],
+        ["Implement ID", str(sim.implement_id)],
+        ["Cone Index", _fmt_decimal(sim.cone_index)],
+        ["Depth", _fmt_decimal(sim.depth)],
+        ["Speed", _fmt_decimal(sim.speed)],
+        ["Field Area", _fmt_decimal(sim.field_area)],
+        ["Field Length", _fmt_decimal(sim.field_length)],
+        ["Field Width", _fmt_decimal(sim.field_width)],
+        ["Turns", str(sim.number_of_turns) if sim.number_of_turns is not None else ""],
+        ["Soil", " / ".join(filter(None, [sim.soil_texture or "", sim.soil_hardness or ""]))],
+        ["Status Message", sim.status_message or ""],
+        ["Recommendations", sim.recommendations or ""],
+    ]
+    elements.append(table(overview, col_widths=[page_w * 0.34, page_w * 0.66]))
+
+    metrics = [
+        ["Metric", "Value"],
+        ["Draft Force", _fmt_decimal(sim.draft_force)],
+        ["Drawbar Power", _fmt_decimal(sim.drawbar_power)],
+        ["Slip", _fmt_decimal(sim.slip)],
+        ["Traction Efficiency", _fmt_decimal(sim.traction_efficiency)],
+        ["Power Utilization", _fmt_decimal(sim.power_utilization)],
+        ["Field Capacity Theoretical", _fmt_decimal(sim.field_capacity_theoretical)],
+        ["Field Capacity Actual", _fmt_decimal(sim.field_capacity_actual)],
+        ["Field Efficiency", _fmt_decimal(sim.field_efficiency)],
+        ["Fuel Consumption / ha", _fmt_decimal(sim.fuel_consumption_per_hectare)],
+        ["Overall Efficiency", _fmt_decimal(sim.overall_efficiency)],
+        ["Front Ballast", _fmt_decimal(sim.ballast_front_required)],
+        ["Rear Ballast", _fmt_decimal(sim.ballast_rear_required)],
+    ]
+    elements.append(Paragraph("Performance Metrics", h2_style))
+    elements.append(table(metrics, col_widths=[page_w * 0.55, page_w * 0.45]))
+
+    if sim.results:
+        results_data = [["Result Key", "Value"]]
+        for key, value in sim.results.items():
+            results_data.append([key, "" if value is None else str(value)])
+        elements.append(Paragraph("Detailed Results", h2_style))
+        elements.append(table(results_data, col_widths=[page_w * 0.42, page_w * 0.58]))
+
+    doc.build(elements)
+    return buf.getvalue()
 
 
 @router.get("", response_model=PaginatedResponse[SimulationRead])
@@ -298,4 +480,63 @@ def delete_simulation(
     if not obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Simulation not found")
     return {"ok": True, "id": id}
+
+
+@router.get("/{id}/export")
+def export_simulation(
+    id: uuid.UUID,
+    format: str = Query(default="csv", description="Export format: csv or pdf"),
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if format not in ("csv", "pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="format must be 'csv' or 'pdf'",
+        )
+
+    sim = db.scalars(
+        select(Simulation)
+        .where(Simulation.id == id)
+        .options(
+            selectinload(Simulation.tractor),
+            selectinload(Simulation.implement),
+        )
+    ).first()
+    if not sim:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Simulation not found")
+
+    sim_read = SimulationRead.model_validate(sim)
+    tractor_name = sim.tractor.name if sim.tractor is not None else None
+    implement_name = sim.implement.name if sim.implement is not None else None
+    safe_id = str(id)[:8]
+
+    if format == "csv":
+        data = _build_simulation_csv_bytes(
+            sim_read,
+            tractor_name=tractor_name,
+            implement_name=implement_name,
+        )
+        filename = f"simulation_{safe_id}.csv"
+        media_type = "text/csv"
+    else:
+        try:
+            data = _build_simulation_pdf_bytes(
+                sim_read,
+                tractor_name=tractor_name,
+                implement_name=implement_name,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        filename = f"simulation_{safe_id}.pdf"
+        media_type = "application/pdf"
+
+    return StreamingResponse(
+        iter([data]),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
