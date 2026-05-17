@@ -561,11 +561,16 @@ def get_session_area_summary(
         )
     ) or 0
 
-    if session.area_ha is None and session.status == "completed":
+    if session.status == "completed" and (
+        session.area_ha is None
+        or session.total_cost_inr is None
+        or session.charge_per_ha_applied is None
+    ):
         from app.services.field_area_service import finalize_session_area
         from app.services.operation_cost_service import compute_session_cost
 
-        finalize_session_area(session_id, db)
+        if session.area_ha is None:
+            finalize_session_area(session_id, db)
         db.refresh(session)
         compute_session_cost(session, db)
         db.commit()

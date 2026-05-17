@@ -82,7 +82,7 @@ def create_tractor(
 ):
     tire_payload = payload.tire_specification
     tractor_data = payload.model_dump(exclude={"tire_specification"})
-    extra = {"is_library": False}
+    extra = {"is_library": False, "owner_id": current_user.id}
     tractor = tractor_crud.create(db, obj_in=TractorCreate(**tractor_data), extra=extra)
     if tire_payload is not None:
         tire_crud.create(db, obj_in=tire_payload, extra={"tractor_id": tractor.id})

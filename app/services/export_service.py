@@ -33,6 +33,10 @@ def _fmt_float(value: Optional[float], precision: int = 2) -> str:
     return f"{value:.{precision}f}"
 
 
+def _fmt_area(value: Optional[float]) -> str:
+    return _fmt_float(value, 4)
+
+
 def _fmt_duration(minutes: Optional[float]) -> str:
     if minutes is None:
         return ""
@@ -76,7 +80,7 @@ def build_csv_bytes(report: SessionSummaryReport) -> bytes:
     w.writerow(["Started At", _fmt_ts(report.started_at)])
     w.writerow(["Ended At", _fmt_ts(report.ended_at)])
     w.writerow(["Duration", _fmt_duration(report.duration_minutes)])
-    w.writerow(["Area Covered (ha)", _fmt_float(report.area_ha)])
+    w.writerow(["Area Covered (ha)", _fmt_area(report.area_ha)])
     w.writerow(["Total Distance", _fmt_distance(report.total_distance_m)])
     w.writerow(["Total Cost (INR)", _fmt_float(report.total_cost_inr)])
     w.writerow([_billing_rate_label(report.operation_type), _fmt_float(report.charge_per_ha_applied)])
@@ -246,7 +250,7 @@ def build_pdf_bytes(report: SessionSummaryReport) -> bytes:
         ["Started", _fmt_ts(report.started_at)],
         ["Ended", _fmt_ts(report.ended_at)],
         ["Duration", _fmt_duration(report.duration_minutes)],
-        ["Area Covered", f"{_fmt_float(report.area_ha)} ha" if report.area_ha else "—"],
+        ["Area Covered", f"{_fmt_area(report.area_ha)} ha" if report.area_ha is not None else "—"],
         ["Total Distance", _fmt_distance(report.total_distance_m) if report.total_distance_m else "—"],
     ]
     if report.total_cost_inr is not None:

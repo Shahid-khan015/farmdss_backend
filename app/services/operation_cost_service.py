@@ -33,6 +33,45 @@ def _session_duration_hours(session: OperationSession) -> Optional[float]:
     return round(secs / 3600.0, 4)
 
 
+def _resolve_charge(
+    *,
+    db: Session,
+    owner_id: object | None,
+    operation_type: str,
+) -> OperationCharge | None:
+    op_key = operation_type.strip().lower()
+    if owner_id is not None:
+        return db.scalars(
+            select(OperationCharge).where(
+                OperationCharge.owner_id == owner_id,
+                func.lower(func.trim(OperationCharge.operation_type)) == op_key,
+            )
+        ).first()
+
+    # Backward-compatible fallback for existing/library sessions where tractor_owner_id
+    # was not stored. If exactly one owner has configured this operation, use it; if more
+    # than one exists, leave cost pending rather than applying the wrong owner's rate.
+    candidates = list(
+        db.scalars(
+            select(OperationCharge).where(
+                func.lower(func.trim(OperationCharge.operation_type)) == op_key,
+            )
+        ).all()
+    )
+    if len(candidates) == 1:
+        logger.warning(
+            "Using single configured operation charge fallback for owner-less session operation_type=%r",
+            operation_type,
+        )
+        return candidates[0]
+    if len(candidates) > 1:
+        logger.warning(
+            "Multiple operation charges found for owner-less session operation_type=%r; cost left pending",
+            operation_type,
+        )
+    return None
+
+
 def resolve_session_billing(session: OperationSession, db: Session) -> SessionBilling:
     """
     Billing from OperationCharge for the tractor owner:
@@ -44,17 +83,9 @@ def resolve_session_billing(session: OperationSession, db: Session) -> SessionBi
     owner_id = session.tractor_owner_id
     if owner_id is None and tractor is not None:
         owner_id = tractor.owner_id
-    if owner_id is None:
-        logger.warning("No owner on tractor - skipping cost")
-        return SessionBilling(None, None, None)
 
     op_key = (session.operation_type or "").strip().lower()
-    charge = db.scalars(
-        select(OperationCharge).where(
-            OperationCharge.owner_id == owner_id,
-            func.lower(func.trim(OperationCharge.operation_type)) == op_key,
-        )
-    ).first()
+    charge = _resolve_charge(db=db, owner_id=owner_id, operation_type=session.operation_type or "")
 
     if charge is None:
         logger.warning(
@@ -62,7 +93,7 @@ def resolve_session_billing(session: OperationSession, db: Session) -> SessionBi
             owner_id,
             session.operation_type,
         )
-        return SessionBilling(None, None, None)
+        return SessionBilling(None, None, "Operation charge not configured for this owner/operation")
 
     op_label = (session.operation_type or "").strip() or (session.operation_type or "Operation")
 
@@ -92,7 +123,7 @@ def resolve_session_billing(session: OperationSession, db: Session) -> SessionBi
 
     area = float(session.area_ha)
     total_cost = round(rate * area, 2)
-    note = f"{op_label}: Rs {rate}/ha × {round(area, 4)} ha = Rs {total_cost}"
+    note = f"{op_label}: Rs {rate}/ha × {area:.4f} ha = Rs {total_cost}"
     return SessionBilling(total_cost, rate, note)
 
 
@@ -123,4 +154,4 @@ def session_billing_differs_from_persisted(session: OperationSession, billing: S
             return True
         if abs(float(stored) - float(resolved)) > 0.005:
             return True
-    return False
+    return (session.cost_note or None) != (billing.cost_note or None)

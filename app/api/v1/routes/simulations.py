@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -13,7 +14,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_db
-from app.core.performance_calculator import PerformanceInputs, calculate_performance
+from app.core.engineering_validation import validate_operating_ranges
+from app.core.performance_calculator import (
+    PerformanceInputs,
+    calculate_performance,
+    estimate_required_draft_power,
+)
 from app.crud.implement import implement_crud
 from app.crud.operating_condition import operating_condition_crud
 from app.crud.simulation import simulation_crud
@@ -27,6 +33,7 @@ from app.schemas.common import DeleteResponse, PaginatedResponse
 from app.schemas.simulation import SimulationRead, SimulationRunRequest
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _fmt_decimal(value: Optional[Decimal], precision: int = 2) -> str:
@@ -429,6 +436,91 @@ def run_simulation(
         field_area_ha=float(field_area),
         field_width_m=float(field_width),
     )
+    validation_errors = validate_operating_ranges(
+        {
+            "speed": speed,
+            "depth": depth,
+            "cone_index": cone_index,
+            "implement_width": implement.width,
+            "pto_power": tractor.pto_power,
+        }
+    )
+    if validation_errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "status": "validation_failed",
+                "errors": validation_errors,
+            },
+        )
+
+    draft_force, required_power_kw = estimate_required_draft_power(perf_inputs)
+    available_power_kw = (
+        float(tractor.pto_power)
+        * (float(tractor.transmission_efficiency) / 100.0)
+        * ((100.0 - float(tractor.power_reserve)) / 100.0)
+    )
+    power_limit_kw = available_power_kw * 0.85
+    if required_power_kw > power_limit_kw:
+        power_utilization = (required_power_kw / available_power_kw) * 100.0 if available_power_kw > 0 else None
+        recommendation = "Implement exceeds tractor capability. Reduce tillage depth, reduce implement width, or increase tractor HP."
+        results = {
+            "draft_force": draft_force,
+            "drawbar_power": required_power_kw,
+            "power_utilization": power_utilization,
+            "status": "Not Recommended",
+            "warnings": ["Implement load exceeds tractor safe operating capability."],
+            "confidence": "Low",
+            "recommendation_messages": [
+                "Reduce operating depth",
+                "Reduce implement width",
+                "Increase tractor HP",
+            ],
+            "status_message": "Implement exceeds tractor capability.",
+            "recommendations": recommendation,
+            "load_status": "Over Loaded",
+            "compatibility": {
+                "required_power_kw": required_power_kw,
+                "available_power_kw": available_power_kw,
+                "safe_limit_kw": power_limit_kw,
+                "recommended_action": recommendation,
+            },
+            "calculation_mode": "legacy_vb_guarded",
+        }
+        logger.warning(
+            "simulation.compatibility_failure",
+            extra={
+                "tractor_id": str(tractor.id),
+                "implement_id": str(implement.id),
+                "draft_force_n": draft_force,
+                "required_power_kw": required_power_kw,
+                "available_power_kw": available_power_kw,
+                "power_utilization_pct": power_utilization,
+            },
+        )
+        sim = simulation_crud.create(
+            db,
+            obj_in=payload,
+            extra={
+                "operating_conditions_preset_id": payload.operating_conditions_preset_id,
+                "cone_index": cone_index,
+                "depth": depth,
+                "speed": speed,
+                "field_area": field_area,
+                "field_length": field_length,
+                "field_width": field_width,
+                "number_of_turns": number_of_turns,
+                "soil_texture": soil_texture,
+                "soil_hardness": soil_hardness,
+                "results": results,
+                "draft_force": Decimal(str(draft_force)),
+                "drawbar_power": Decimal(str(required_power_kw)),
+                "power_utilization": Decimal(str(power_utilization)) if power_utilization is not None else None,
+                "status_message": results["status_message"],
+                "recommendations": recommendation,
+            },
+        )
+        return sim
 
     try:
         results = calculate_performance(perf_inputs)

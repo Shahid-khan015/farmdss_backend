@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -64,6 +64,34 @@ def _to_utc_opt(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def _parse_report_datetime(
+    date_value: str,
+    time_value: Optional[str],
+    *,
+    default_time: str,
+    timezone_offset_minutes: int,
+    is_end: bool,
+) -> datetime:
+    """Parse a user-selected local report boundary into UTC.
+
+    JavaScript's getTimezoneOffset is UTC - local time. Applying that offset
+    here keeps calendar filters aligned with the user's selected local day.
+    """
+    raw_time = time_value or default_time
+    try:
+        parsed = datetime.strptime(f"{date_value} {raw_time}", "%Y-%m-%d %H:%M")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date must be YYYY-MM-DD and time must be HH:MM",
+        ) from exc
+
+    if is_end:
+        parsed = parsed.replace(second=59, microsecond=999999)
+
+    return (parsed + timedelta(minutes=timezone_offset_minutes)).replace(tzinfo=timezone.utc)
+
+
 @router.get("/summary")
 def get_report_summary(
     start_date: Optional[str] = Query(default=None),
@@ -72,33 +100,36 @@ def get_report_summary(
     end_time: Optional[str] = Query(default=None),
     operation_type: Optional[str] = Query(default=None),
     tractor_id: Optional[str] = Query(default=None),
+    timezone_offset_minutes: int = Query(default=0, ge=-840, le=840),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.role not in {"owner", "operator", "farmer", "researcher"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to view reports",
+        )
+
     start_dt: Optional[datetime] = None
     end_dt: Optional[datetime] = None
 
     if start_date is not None:
-        try:
-            start_dt = datetime.strptime(
-                f"{start_date} {start_time or '00:00'}", "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=timezone.utc)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="start_date must be YYYY-MM-DD and start_time must be HH:MM",
-            ) from exc
+        start_dt = _parse_report_datetime(
+            start_date,
+            start_time,
+            default_time="00:00",
+            timezone_offset_minutes=timezone_offset_minutes,
+            is_end=False,
+        )
 
     if end_date is not None:
-        try:
-            end_dt = datetime.strptime(
-                f"{end_date} {end_time or '23:59'}", "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=timezone.utc)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="end_date must be YYYY-MM-DD and end_time must be HH:MM",
-            ) from exc
+        end_dt = _parse_report_datetime(
+            end_date,
+            end_time,
+            default_time="23:59",
+            timezone_offset_minutes=timezone_offset_minutes,
+            is_end=True,
+        )
 
     if start_dt is not None and end_dt is not None and end_dt < start_dt:
         raise HTTPException(
@@ -117,7 +148,9 @@ def get_report_summary(
             ) from exc
 
     filters = ReportFilters(
-        owner_id=current_user.id if current_user.role == "owner" else None,
+        # Owners/researchers intentionally see all reports. Operators and
+        # farmers are restricted to their own operation/farm sessions.
+        owner_id=None,
         operator_id=current_user.id if current_user.role == "operator" else None,
         client_farmer_id=current_user.id if current_user.role == "farmer" else None,
         tractor_id=tractor_uuid,

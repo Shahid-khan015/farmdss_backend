@@ -87,4 +87,19 @@ class SimulationRead(UUIDResponse, Timestamped, BaseModel):
     ballast_rear_required: Optional[Decimal] = None
     status_message: Optional[str] = None
     recommendations: Optional[str] = None
+    status: Optional[str] = None
+    warnings: Optional[list[str]] = None
+    confidence: Optional[str] = None
+    recommendation_messages: Optional[list[str]] = None
+
+    @model_validator(mode="after")
+    def hydrate_engineering_metadata(self) -> "SimulationRead":
+        if self.results:
+            self.status = self.status or self.results.get("status")
+            self.warnings = self.warnings or self.results.get("warnings")
+            self.confidence = self.confidence or self.results.get("confidence")
+            self.recommendation_messages = (
+                self.recommendation_messages or self.results.get("recommendation_messages")
+            )
+        return self
 

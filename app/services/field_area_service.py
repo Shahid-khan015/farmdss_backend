@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import uuid
 from typing import List, Optional, Tuple
@@ -9,6 +10,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 GPS_FEED_KEYS = ("position_tracking", "gpsloc")
+MAX_REASONABLE_GPS_STEP_M = 500.0
+
+logger = logging.getLogger(__name__)
 
 
 def parse_gps_points(session_id: uuid.UUID, db: Session) -> List[Tuple[float, float]]:
@@ -114,30 +118,38 @@ def compute_covered_area_ha(
     if len(points) < 2:
         return 0.0
 
-    total_path_m = 0.0
+    total_path_m = compute_total_path_distance_m(points)
+
+    # For field operations the worked area is the covered swath: path length x implement width.
+    # Polygon area is only a fallback when implement width is unknown; back-and-forth passes often
+    # produce a near-zero or self-crossing polygon and should not cap the worked area.
+    covered_area_m2 = total_path_m * implement_width_m
+    return covered_area_m2 / 10000.0
+
+
+def _filtered_path_segments(points: List[Tuple[float, float]]) -> List[float]:
+    segments: List[float] = []
     for i in range(len(points) - 1):
         lat1, lon1 = points[i]
         lat2, lon2 = points[i + 1]
-        total_path_m += haversine_distance_m(lat1, lon1, lat2, lon2)
-
-    covered_area_m2 = total_path_m * implement_width_m
-    covered_area_ha = covered_area_m2 / 10000.0
-    polygon_area_ha = compute_polygon_area_ha(points)
-    if polygon_area_ha > 0:
-        return min(covered_area_ha, polygon_area_ha)
-    return covered_area_ha
+        distance = haversine_distance_m(lat1, lon1, lat2, lon2)
+        if distance <= 0.25:
+            continue
+        if distance > MAX_REASONABLE_GPS_STEP_M:
+            logger.info(
+                "field_area.gps_step_ignored",
+                extra={"distance_m": distance, "lat1": lat1, "lon1": lon1, "lat2": lat2, "lon2": lon2},
+            )
+            continue
+        segments.append(distance)
+    return segments
 
 
 def compute_total_path_distance_m(points: List[Tuple[float, float]]) -> float:
     """Return the total length of the GPS path in metres."""
     if len(points) < 2:
         return 0.0
-    total = 0.0
-    for i in range(len(points) - 1):
-        lat1, lon1 = points[i]
-        lat2, lon2 = points[i + 1]
-        total += haversine_distance_m(lat1, lon1, lat2, lon2)
-    return total
+    return sum(_filtered_path_segments(points))
 
 
 def finalize_session_area(session_id: uuid.UUID, db: Session) -> float:
@@ -149,6 +161,16 @@ def finalize_session_area(session_id: uuid.UUID, db: Session) -> float:
         return 0.0
 
     area = compute_covered_area_ha(points, session.implement_width_m)
-    session.area_ha = round(area, 4)
+    session.area_ha = round(max(0.0, area), 4)
+    logger.info(
+        "field_area.finalized",
+        extra={
+            "session_id": str(session_id),
+            "gps_points": len(points),
+            "implement_width_m": session.implement_width_m,
+            "area_ha": session.area_ha,
+            "distance_m": compute_total_path_distance_m(points),
+        },
+    )
     db.flush()
     return area

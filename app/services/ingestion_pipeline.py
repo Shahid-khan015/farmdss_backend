@@ -32,9 +32,20 @@ def ingest_reading(
     Returns (inserted, row_if_present).
     """
     new_id = uuid.uuid4()
-    active_session = db.query(OperationSession).filter(
-        OperationSession.status.in_(("active", "paused"))
-    ).order_by(OperationSession.started_at.desc()).first()
+    active_session = None
+    if normalized.session_id is not None:
+        active_session = db.scalars(
+            select(OperationSession).where(
+                OperationSession.id == normalized.session_id,
+                OperationSession.status == "active",
+                OperationSession.gps_tracking_enabled.is_(True),
+            )
+        ).first()
+    if active_session is None:
+        active_session = db.query(OperationSession).filter(
+            OperationSession.status == "active",
+            OperationSession.gps_tracking_enabled.is_(True),
+        ).order_by(OperationSession.started_at.desc()).first()
     values = {
         "id": new_id,
         "device_id": normalized.device_id,

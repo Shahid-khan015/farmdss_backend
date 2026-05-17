@@ -5,10 +5,11 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.session import FuelLog, IoTAlert, OperationSession, WageRecord
+from app.models.tractor import Tractor
 from app.models.user import User
 
 
@@ -23,9 +24,43 @@ class ReportFilters:
     operation_type: Optional[str] = None
 
 
+def _finalize_completed_sessions_for_report(session_ids: list[UUID], db: Session) -> None:
+    from app.services.field_area_service import finalize_session_area
+    from app.services.operation_cost_service import compute_session_cost
+
+    sessions = list(
+        db.scalars(
+            select(OperationSession).where(
+                OperationSession.id.in_(session_ids),
+                OperationSession.status == "completed",
+                or_(
+                    OperationSession.area_ha.is_(None),
+                    OperationSession.total_cost_inr.is_(None),
+                    OperationSession.charge_per_ha_applied.is_(None),
+                ),
+            )
+        ).all()
+    )
+    if not sessions:
+        return
+
+    for session in sessions:
+        if session.area_ha is None:
+            finalize_session_area(session.id, db)
+            db.refresh(session)
+        compute_session_cost(session, db)
+    db.commit()
+
+
 def _apply_filters(stmt, filters: ReportFilters):
     if filters.owner_id is not None:
-        stmt = stmt.where(OperationSession.tractor_owner_id == filters.owner_id)
+        owner_tractor_ids = select(Tractor.id).where(Tractor.owner_id == filters.owner_id)
+        stmt = stmt.where(
+            or_(
+                OperationSession.tractor_owner_id == filters.owner_id,
+                OperationSession.tractor_id.in_(owner_tractor_ids),
+            )
+        )
     if filters.operator_id is not None:
         stmt = stmt.where(OperationSession.operator_id == filters.operator_id)
     if filters.client_farmer_id is not None:
@@ -35,14 +70,31 @@ def _apply_filters(stmt, filters: ReportFilters):
     if filters.operation_type is not None:
         stmt = stmt.where(OperationSession.operation_type == filters.operation_type)
     if filters.start_datetime is not None:
-        stmt = stmt.where(OperationSession.started_at >= filters.start_datetime)
+        stmt = stmt.where(
+            func.coalesce(OperationSession.ended_at, func.now()) >= filters.start_datetime
+        )
     if filters.end_datetime is not None:
         stmt = stmt.where(OperationSession.started_at <= filters.end_datetime)
     return stmt
 
 
 def generate_report(filters: ReportFilters, db: Session) -> dict:
-    base = _apply_filters(select(OperationSession.id), filters).subquery()
+    session_ids = list(db.scalars(_apply_filters(select(OperationSession.id), filters)).all())
+    if not session_ids:
+        return {
+            "total_sessions": 0,
+            "total_area_ha": 0.0,
+            "total_duration_hours": 0.0,
+            "total_wages_paid": 0.0,
+            "total_operation_charges": 0.0,
+            "total_fuel_litres": 0.0,
+            "total_fuel_cost": 0.0,
+            "alert_counts": {"warning": 0, "critical": 0},
+            "sessions": [],
+        }
+
+    _finalize_completed_sessions_for_report(session_ids, db)
+    base = select(OperationSession.id).where(OperationSession.id.in_(session_ids)).subquery()
 
     duration_hours_expr = (
         func.extract("epoch", func.coalesce(OperationSession.ended_at, OperationSession.started_at) - OperationSession.started_at)
@@ -59,11 +111,20 @@ def generate_report(filters: ReportFilters, db: Session) -> dict:
     )
     total_sessions, total_area_ha, total_duration_hours = db.execute(summary_stmt).one()
 
-    wages_stmt = select(func.coalesce(func.sum(WageRecord.total_amount), 0.0)).where(
-        WageRecord.session_id.in_(select(base.c.id)),
-        WageRecord.approved.is_(True),
+    charges_stmt = select(
+        func.coalesce(
+            func.sum(
+                func.coalesce(OperationSession.total_cost_inr, WageRecord.total_amount, 0.0)
+            ),
+            0.0,
+        )
+    ).outerjoin(
+        WageRecord,
+        WageRecord.session_id == OperationSession.id,
+    ).where(
+        OperationSession.id.in_(select(base.c.id)),
     )
-    total_wages_paid = db.scalar(wages_stmt) or 0.0
+    total_operation_charges = db.scalar(charges_stmt) or 0.0
 
     fuel_stmt = select(
         func.coalesce(func.sum(FuelLog.litres), 0.0),
@@ -121,7 +182,8 @@ def generate_report(filters: ReportFilters, db: Session) -> dict:
         "total_sessions": int(total_sessions or 0),
         "total_area_ha": float(total_area_ha or 0.0),
         "total_duration_hours": float(total_duration_hours or 0.0),
-        "total_wages_paid": float(total_wages_paid or 0.0),
+        "total_wages_paid": float(total_operation_charges or 0.0),
+        "total_operation_charges": float(total_operation_charges or 0.0),
         "total_fuel_litres": float(total_fuel_litres or 0.0),
         "total_fuel_cost": float(total_fuel_cost or 0.0),
         "alert_counts": alert_counts,

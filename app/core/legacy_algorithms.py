@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 
 from app.core.constants import GRAVITY
+from app.core.engineering_validation import (
+    build_recommendations,
+    clamp,
+    derive_confidence,
+    derive_simulation_status,
+)
 from app.models.enums import ImplementType, SoilTexture
+
+logger = logging.getLogger(__name__)
+
+MAX_SLIP = 20.0
+MAX_ITERATIONS = 500
 
 
 @dataclass(frozen=True)
@@ -72,6 +84,15 @@ def _fi_factor(implement_type: ImplementType, soil_texture: SoilTexture) -> floa
     return fi_table[implement_type][soil_texture]
 
 
+def estimate_draft_force(inputs: LegacyInputs) -> float:
+    fi = _fi_factor(inputs.implement_type, inputs.soil_texture)
+    return fi * (
+        inputs.asae_param_a
+        + inputs.asae_param_b * inputs.speed_kmh
+        + inputs.asae_param_c * (inputs.speed_kmh**2)
+    ) * inputs.width_m * inputs.depth_cm
+
+
 def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     if inputs.width_m <= 0:
         raise ValueError("Implement width must be > 0")
@@ -83,11 +104,8 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         raise ValueError("PTO power must be > 0")
 
     fi = _fi_factor(inputs.implement_type, inputs.soil_texture)
-    draft_n = fi * (
-        inputs.asae_param_a
-        + inputs.asae_param_b * inputs.speed_kmh
-        + inputs.asae_param_c * (inputs.speed_kmh**2)
-    ) * inputs.width_m * inputs.depth_cm
+    draft_n = estimate_draft_force(inputs)
+    logger.info("legacy_simulation.draft_force", extra={"draft_force_n": draft_n})
 
     # Legacy variables
     tw_kg = inputs.front_axle_weight_kg + inputs.rear_axle_weight_kg
@@ -104,9 +122,10 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     fd_n = 0.0
     bnr = 0.0
     bnf = 0.0
-    max_outer = 10000
+    converged = False
+    warnings: list[str] = []
 
-    for _ in range(max_outer):
+    for iteration in range(MAX_ITERATIONS):
         while True:
             ef = rr_f1 * inputs.front_rolling_radius_m
             rr_r2 = rr_r1
@@ -135,6 +154,9 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
             if bnr <= 0 or bnf <= 0:
                 raise ValueError("Invalid mobility number, check tire or cone-index inputs")
 
+            bnr = clamp(bnr, 5.0, 80.0)
+            bnf = clamp(bnf, 5.0, 80.0)
+
             rr_r1 = (1.0 / bnr) + 0.04 + ((0.005 * slip) / (bnr**0.5))
             rr_f1 = (1.0 / bnf) + 0.04
 
@@ -143,17 +165,25 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
 
         gt = 0.88 * (1.0 - math.exp(-0.1 * bnr)) * (1.0 - math.exp(-7.5 * 0.01 * slip)) + 0.04
         # Old VB line uses RRr/RRf; intended behavior is rear+front rolling resistance.
-        nt2 = gt - (rr_r1 + rr_f1)
+        nt2 = clamp(gt - (rr_r1 + rr_f1), 0.01, 1.0)
         pull_st = nt2 * rd_n
-        slip += 0.1
         if pull_st >= draft_n:
+            converged = True
+            break
+        slip = clamp(slip + 0.1, 0.0, MAX_SLIP)
+        if slip >= MAX_SLIP:
+            warnings.append("Slip iteration reached the 20% engineering limit before full draft convergence.")
+            logger.warning(
+                "legacy_simulation.convergence_warning",
+                extra={"slip_pct": slip, "iteration": iteration, "pull_n": pull_st, "draft_force_n": draft_n},
+            )
             break
 
-    if pull_st < draft_n:
-        raise ValueError("Slip loop did not converge to required draft pull")
+    if not converged:
+        warnings.append("Simulation retained bounded partial results from the last stable iteration.")
 
     mr_ratio = rr_r1 + rr_f1
-    te_pct = (100.0 - slip) * (gt - mr_ratio) / gt
+    te_pct = clamp((100.0 - slip) * (gt - mr_ratio) / gt, 35.0, 90.0)
     if te_pct == 0:
         raise ValueError("Tractive efficiency became zero")
 
@@ -165,7 +195,7 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     if fc_th <= 0:
         raise ValueError("Theoretical field capacity is non-positive")
 
-    turning_time_s = 15.56 + 2.61 * (inputs.width_m / inputs.speed_kmh) - 1.41 * inputs.speed_kmh
+    turning_time_s = clamp(15.56 + 2.61 * (inputs.width_m / inputs.speed_kmh) - 1.41 * inputs.speed_kmh, 8.0, 45.0)
     number_turns = max(0, int(round(inputs.field_width_m / inputs.width_m)))
     total_turning_time_h = (turning_time_s * 2.0 * number_turns) / 3600.0
     theoretical_time_h = inputs.field_area_ha / fc_th
@@ -174,7 +204,7 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         raise ValueError("Total operating time is non-positive")
 
     fc_ac = inputs.field_area_ha / total_time_h
-    field_eff_pct = (fc_ac / fc_th) * 100.0
+    field_eff_pct = clamp((fc_ac / fc_th) * 100.0, 50.0, 95.0)
 
     pow_av = (
         inputs.pto_power_kw
@@ -184,7 +214,7 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     )
     if pow_av == 0:
         raise ValueError("Available power is zero")
-    pused_pct = (pdb_kw / pow_av) * 100.0
+    pused_pct = clamp((pdb_kw / pow_av) * 100.0, 0.0, 150.0)
 
     ballast_front_kg = 0.0
     if kwf < 0.2:
@@ -192,12 +222,14 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         ballast_front_kg = (rfwd - fd_n) / GRAVITY
 
     recommendation = ""
-    if slip <= 7.9:
-        recommendation = "Increase depth or speed of operation, because slip is less than 8%"
-    elif 8.0 <= slip <= 15.0:
-        recommendation = "You are working in optimum slip range, 8 to 15 %"
-    else:
-        recommendation = "Ballast is required to reduce the slip up to 15% so max tractor power can be used"
+    recommendation_items = build_recommendations(
+        slip=slip,
+        draft_force=draft_n,
+        traction_efficiency=te_pct,
+        fuel_consumption=None,
+        power_utilization=pused_pct,
+    )
+    recommendation = "; ".join(recommendation_items)
 
     ballast_rear_kg = 0.0
     slip3 = None
@@ -228,24 +260,50 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         nt3 = draft_n / crwd
         te3_after = nt3 / gt3 * (100.0 - slip)
 
-    x = (pdb_kw / ((inputs.transmission_efficiency_pct / 100.0) * (te_pct / 100.0))) / inputs.pto_power_kw
-    inside = 738.0 * x + 173.0
-    if inside < 0:
-        raise ValueError("Fuel model invalid input (negative square root)")
-    sfc = (2.64 * x + 3.91) - (0.203 * math.sqrt(inside))
-    fuel_cons_l_per_ha = sfc * pdb_kw / fc_ac
-    overall_pct = pdb_kw * 3600.0 / 1000.0 / (fc_th * fuel_cons_l_per_ha * 35.5) * 100.0
+    fuel_lph = 0.22 * pdb_kw
+    fuel_cons_l_per_ha = clamp(fuel_lph / fc_ac, 2.0, 80.0)
+    sfc = fuel_lph / pdb_kw if pdb_kw > 0 else 0.22
+    overall_pct = clamp(pdb_kw * 3600.0 / 1000.0 / (fc_th * fuel_cons_l_per_ha * 35.5) * 100.0, 0.0, 45.0)
+    recommendation = "; ".join(
+        build_recommendations(
+            slip=slip,
+            draft_force=draft_n,
+            traction_efficiency=te_pct,
+            fuel_consumption=fuel_cons_l_per_ha,
+            power_utilization=pused_pct,
+        )
+    )
 
-    if 90.0 < pused_pct < 95.0:
+    if 65.0 <= pused_pct <= 90.0:
         load_status = "Properly Loaded"
-    elif pused_pct < 90.0:
+    elif pused_pct < 65.0:
         load_status = "Under Loaded"
     else:
         load_status = "Over Loaded"
 
-    status_message = "OK"
+    simulation_status = derive_simulation_status(
+        slip=slip,
+        power_utilization=pused_pct,
+        field_efficiency=field_eff_pct,
+        converged=converged,
+    )
+    confidence = derive_confidence(compatible=True, converged=converged, slip=slip)
+    status_message = simulation_status
     if te_pct < 0:
         status_message = "Either decrease depth or speed of operation"
+
+    logger.info(
+        "legacy_simulation.outputs",
+        extra={
+            "draft_force_n": draft_n,
+            "slip_pct": slip,
+            "traction_efficiency_pct": te_pct,
+            "fuel_l_per_ha": fuel_cons_l_per_ha,
+            "front_axle_load_n": fd_n,
+            "rear_axle_load_n": rd_n,
+            "power_utilization_pct": pused_pct,
+        },
+    )
 
     return {
         "draft_force": draft_n,
@@ -270,6 +328,11 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         "status_message": status_message,
         "recommendations": recommendation,
         "load_status": load_status,
+        "status": simulation_status,
+        "warnings": warnings,
+        "confidence": confidence,
+        "recommendation_messages": recommendation.split("; "),
+        "converged": converged,
         "legacy_fi": fi,
         "legacy_turning_time_seconds": turning_time_s,
         "legacy_number_of_turns": number_turns,
