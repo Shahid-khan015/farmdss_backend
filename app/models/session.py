@@ -30,10 +30,10 @@ class OperationSession(Base):
         default=uuid.uuid4,
         server_default=text("gen_random_uuid()"),
     )
-    tractor_id: Mapped[uuid.UUID] = mapped_column(
+    tractor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("tractors.id", ondelete="RESTRICT"),
-        nullable=False,
+        ForeignKey("tractors.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
     implement_id: Mapped[Optional[uuid.UUID]] = mapped_column(

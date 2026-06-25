@@ -4,6 +4,7 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -11,6 +12,7 @@ from app.crud.simulation import simulation_crud
 from app.crud.tractor import tractor_crud
 from app.crud.tire_specification import tire_crud
 from app.middleware.auth import get_current_user, require_role
+from app.models.session import OperationSession
 from app.models.user import User
 from app.schemas.common import DeleteResponse, PaginatedResponse
 from app.schemas.implement import ImplementRead
@@ -122,7 +124,10 @@ def delete_tractor(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Library tractors cannot be deleted",
         )
-    tractor_crud.remove(db, id=id)
+
+    deleted_obj = tractor_crud.remove(db, id=id)
+    if deleted_obj is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tractor not found")
     return {"ok": True, "id": id}
 
 

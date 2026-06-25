@@ -162,9 +162,87 @@ def _evaluate_threshold(reading: IoTReading, db: Session) -> None:
         db.flush()
 
 
+def _evaluate_preset_range_violation(reading: IoTReading, db: Session, preset: SessionPresetValue) -> bool:
+    if reading.numeric_value is None:
+        return False
+    if preset.required_min is None and preset.required_max is None:
+        return False
+
+    actual = float(reading.numeric_value)
+    label = _human_param_label(preset.parameter_name)
+    unit = preset.unit or ""
+
+    boundary_value: Optional[float] = None
+    direction: Optional[str] = None
+    boundary_label: Optional[str] = None
+
+    if preset.required_min is not None and actual < float(preset.required_min):
+        boundary_value = float(preset.required_min)
+        direction = "below"
+        boundary_label = "minimum"
+    elif preset.required_max is not None and actual > float(preset.required_max):
+        boundary_value = float(preset.required_max)
+        direction = "above"
+        boundary_label = "maximum"
+    else:
+        return False
+
+    if boundary_value == 0:
+        return False
+
+    deviation_pct = abs(actual - boundary_value) / abs(boundary_value) * 100.0
+    if deviation_pct >= float(preset.deviation_pct_crit):
+        deviation_status = "critical"
+    elif deviation_pct >= float(preset.deviation_pct_warn):
+        deviation_status = "warning"
+    else:
+        return False
+
+    msg = (
+        f"{label} {direction} owner preset {boundary_label} by {deviation_pct:.0f}%: "
+        f"{actual:g}{unit} ({boundary_label} allowed: {boundary_value:g}{unit})"
+    )
+
+    existing = db.query(IoTAlert).filter(
+        IoTAlert.session_id == reading.session_id,
+        IoTAlert.feed_key == reading.feed_key,
+        IoTAlert.alert_type == "deviation",
+        IoTAlert.acknowledged == False,  # noqa: E712
+    ).first()
+
+    reference_value = boundary_value
+    if existing is not None:
+        existing.actual_value = actual
+        existing.reference_value = reference_value
+        existing.alert_status = deviation_status
+        existing.message = msg
+        existing.reading_id = reading.id
+        db.flush()
+        return True
+
+    db.add(
+        IoTAlert(
+            session_id=reading.session_id,
+            reading_id=reading.id,
+            feed_key=reading.feed_key,
+            alert_type="deviation",
+            alert_status=deviation_status,
+            actual_value=actual,
+            reference_value=reference_value,
+            message=msg,
+        )
+    )
+    db.flush()
+    return True
+
+
 def _evaluate_preset_deviation(reading: IoTReading, db: Session, preset: SessionPresetValue) -> None:
     if reading.numeric_value is None:
         return
+
+    if _evaluate_preset_range_violation(reading, db, preset):
+        return
+
     if preset.required_value is None:
         return
 
@@ -246,15 +324,18 @@ def evaluate(reading: IoTReading, db: Session) -> None:
                 .first()
             )
 
-        has_owner_target = (
+        has_owner_preset = (
             owner_preset is not None
-            and owner_preset.required_value is not None
-            and float(owner_preset.required_value) != 0.0
+            and (
+                owner_preset.required_value is not None
+                or owner_preset.required_min is not None
+                or owner_preset.required_max is not None
+            )
         )
 
         # Owner/implement presets on the session take precedence over generic thresholds
-        if has_owner_target:
-            _evaluate_preset_deviation(reading, db, owner_preset)
+        if has_owner_preset:
+            _evaluate_preset_deviation(reading, db, owner_preset)  # type: ignore[arg-type]
         else:
             _evaluate_threshold(reading, db)
 

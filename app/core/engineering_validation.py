@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.models.enums import SoilTexture
+
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
@@ -23,6 +25,12 @@ OPERATING_RANGE_CHECKS = (
     RangeCheck("cone_index", None, 300.0, 3000.0, "kPa"),
     RangeCheck("implement_width", None, 0.5, 5.0, "m"),
 )
+
+SOIL_MU_THRESHOLDS = {
+    SoilTexture.COARSE: 0.4,
+    SoilTexture.MEDIUM: 0.55,
+    SoilTexture.FINE: 0.6,
+}
 
 
 def validate_operating_ranges(inputs: dict[str, Any]) -> list[dict[str, Any]]:
@@ -132,6 +140,67 @@ def derive_confidence(
     if slip is not None and (slip < 8.0 or slip > 15.0):
         return "Moderate"
     return "High"
+
+
+def _get_mu_threshold(soil_texture: SoilTexture | str | None) -> float | None:
+    if soil_texture is None:
+        return None
+    if isinstance(soil_texture, SoilTexture):
+        return SOIL_MU_THRESHOLDS.get(soil_texture)
+    try:
+        return SOIL_MU_THRESHOLDS[SoilTexture(str(soil_texture))]
+    except ValueError:
+        return None
+
+
+def evaluate_simulation_rules(
+    *,
+    slip: float | None,
+    coefficient_net_traction: float | None,
+    front_weight_utilization: float | None,
+    power_utilization: float | None,
+    soil_texture: SoilTexture | str | None,
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    recommendations: list[str] = []
+    compatible = True
+    soil_label = soil_texture.value if isinstance(soil_texture, SoilTexture) else str(soil_texture)
+
+    if power_utilization is not None and power_utilization > 100.0:
+        compatible = False
+        warnings.append("Power utilization exceeds 100% and the tractor may be overloaded.")
+        recommendations.extend(
+            ["Reduce implement width", "Increase tractor HP", "Reduce operating depth"]
+        )
+
+    mu_threshold = _get_mu_threshold(soil_texture)
+    if coefficient_net_traction is not None and mu_threshold is not None:
+        if coefficient_net_traction < mu_threshold:
+            compatible = False
+            warnings.append(
+                f"Net traction coefficient μ is below the recommended {mu_threshold:.2f} for {soil_label}."
+            )
+            recommendations.extend(
+                ["Increase tire traction", "Add ballast", "Reduce operating depth"]
+            )
+
+    if front_weight_utilization is not None and front_weight_utilization < 0.2:
+        compatible = False
+        warnings.append(
+            "Front weight utilization is below 0.2 and may cause poor steering and stability."
+        )
+        recommendations.extend(["Add front ballast", "Reduce operating depth"])
+
+    deduped: list[str] = []
+    for item in recommendations:
+        if item not in deduped:
+            deduped.append(item)
+
+    return {
+        "compatible": compatible,
+        "warnings": warnings,
+        "recommendations": deduped,
+    }
 
 
 def _to_float(value: Any) -> float | None:

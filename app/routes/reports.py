@@ -323,7 +323,7 @@ def get_session_summary_report(
         session_id=str(session.id),
         operation_type=session.operation_type,
         status=session.status,
-        tractor_id=str(session.tractor_id),
+        tractor_id=str(session.tractor_id) if session.tractor_id is not None else None,
         implement_id=str(session.implement_id) if session.implement_id else None,
         operator_id=str(session.operator_id),
         operator_name=session.operator.name if session.operator is not None else None,

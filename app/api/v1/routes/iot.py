@@ -12,8 +12,9 @@ from app.api.deps import get_db
 from app.models.iot_reading import IoTReading
 from app.schemas.iot import IotHistoryItem, IotHistoryResponse, IotLatestResponse, LatestFeedReading
 from app.services.alert_engine import get_status_label
-from app.services.iot_query import get_history, get_latest_per_feed
+from app.services.iot_query import get_history, get_latest_per_feed, get_two_latest_gps
 from app.services.normalizer import FEED_UNITS, FEEDS
+from app.services.operation_interpreter import interpret as interpret_operation
 
 router = APIRouter()
 
@@ -50,7 +51,29 @@ def iot_latest(
 ):
     latest = get_latest_per_feed(db, device_id=device_id)
     feeds = [_to_latest_item(fk, latest[fk]) for fk in FEEDS]
-    return IotLatestResponse(device_id=device_id, feeds=feeds)
+
+    # --- Tractor Operation Interpretation ---
+    # Fetch the two most recent GPS readings (needed for movement detection)
+    gps_readings = get_two_latest_gps(db, device_id=device_id)
+
+    result = interpret_operation(
+        gps_readings=gps_readings,
+        pto_reading=latest.get("pto_shaft_speed"),
+        vibration_reading=latest.get("vibration"),
+        machine_reading=latest.get("machine_status"),
+    )
+
+    return IotLatestResponse(
+        device_id=device_id,
+        feeds=feeds,
+        interpretation=result.label,
+        state_key=result.state_key,
+        state_color=result.color,
+        gps_changed=result.gps_changed,
+        pto_rotating=result.pto_rotating,
+        vibrating=result.vibrating,
+        signals_available=result.signals_available,
+    )
 
 
 @router.get("/history", response_model=IotHistoryResponse)

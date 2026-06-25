@@ -23,7 +23,7 @@ def upgrade() -> None:
     op.create_table(
         "sessions",
         sa.Column("id", sa.Uuid(), server_default=sa.text("gen_random_uuid()"), nullable=False),
-        sa.Column("tractor_id", sa.Uuid(), nullable=False),
+        sa.Column("tractor_id", sa.Uuid(), nullable=True),
         sa.Column("implement_id", sa.Uuid(), nullable=True),
         sa.Column("operator_id", sa.Uuid(), nullable=False),
         sa.Column("tractor_owner_id", sa.Uuid(), nullable=True),
@@ -45,7 +45,7 @@ def upgrade() -> None:
             "status IN ('active','paused','completed','aborted')",
             name="ck_sessions_status",
         ),
-        sa.ForeignKeyConstraint(["tractor_id"], ["tractors.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["tractor_id"], ["tractors.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["implement_id"], ["implements.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["operator_id"], ["users.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["tractor_owner_id"], ["users.id"], ondelete="SET NULL"),

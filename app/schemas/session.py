@@ -156,7 +156,7 @@ class SessionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    tractor_id: uuid.UUID
+    tractor_id: Optional[uuid.UUID]
     tractor_name: Optional[str] = None
     implement_id: Optional[uuid.UUID]
     operator_id: uuid.UUID
@@ -193,7 +193,7 @@ class SessionSummaryReport(BaseModel):
     session_id: str
     operation_type: str
     status: str
-    tractor_id: str
+    tractor_id: Optional[str]
     implement_id: Optional[str]
     operator_id: str
     operator_name: Optional[str] = None

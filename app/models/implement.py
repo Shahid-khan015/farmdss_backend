@@ -34,7 +34,11 @@ class Implement(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     working_width_m = Column(Float, nullable=True)
     hitch_type = Column(String(30), nullable=True)
     preset_speed_kmh = Column(Float, nullable=True)
+    preset_speed_kmh_min = Column(Float, nullable=True)
+    preset_speed_kmh_max = Column(Float, nullable=True)
     preset_depth_cm = Column(Float, nullable=True)
+    preset_depth_cm_min = Column(Float, nullable=True)
+    preset_depth_cm_max = Column(Float, nullable=True)
     preset_gearbox_temp_max_c = Column(Float, nullable=True)
 
     owner_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -53,4 +57,5 @@ class Implement(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         "OperationSession",
         back_populates="implement",
         foreign_keys="OperationSession.implement_id",
+        passive_deletes=True,
     )

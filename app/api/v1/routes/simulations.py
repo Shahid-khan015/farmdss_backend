@@ -14,7 +14,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_db
-from app.core.engineering_validation import validate_operating_ranges
+from app.core.engineering_validation import (
+    evaluate_simulation_rules,
+    validate_operating_ranges,
+)
 from app.core.performance_calculator import (
     PerformanceInputs,
     calculate_performance,
@@ -526,6 +529,24 @@ def run_simulation(
         results = calculate_performance(perf_inputs)
     except (ValueError, ZeroDivisionError) as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+    rule_evaluation = evaluate_simulation_rules(
+        slip=results.get("slip"),
+        coefficient_net_traction=results.get("coefficient_net_traction"),
+        front_weight_utilization=results.get("front_weight_utilization"),
+        power_utilization=results.get("power_utilization"),
+        soil_texture=soil_texture_enum,
+    )
+
+    if not rule_evaluation["compatible"]:
+        results["status"] = "Not Recommended"
+        results["status_message"] = "Not Recommended"
+        results["warnings"] = list({*results.get("warnings", []), *rule_evaluation.get("warnings", [])})
+        recommendations = list(dict.fromkeys(
+            (results.get("recommendation_messages") or []) + rule_evaluation.get("recommendations", [])
+        ))
+        results["recommendations"] = "; ".join(recommendations)
+        results["recommendation_messages"] = recommendations
 
     # Persist simulation + key result columns
     sim = simulation_crud.create(

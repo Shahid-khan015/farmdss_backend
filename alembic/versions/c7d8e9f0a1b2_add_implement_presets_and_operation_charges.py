@@ -43,5 +43,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("operation_charges")
     op.drop_column("implements", "preset_gearbox_temp_max_c")
+    op.drop_column("implements", "preset_depth_cm_max")
+    op.drop_column("implements", "preset_depth_cm_min")
     op.drop_column("implements", "preset_depth_cm")
+    op.drop_column("implements", "preset_speed_kmh_max")
+    op.drop_column("implements", "preset_speed_kmh_min")
     op.drop_column("implements", "preset_speed_kmh")

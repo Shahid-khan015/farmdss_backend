@@ -55,6 +55,8 @@ def _to_session_response(obj: OperationSession) -> SessionResponse:
     tractor = getattr(obj, "tractor", None)
     if tractor is not None:
         payload["tractor_name"] = tractor.name
+    if getattr(obj, "tractor_id", None) is None:
+        payload["tractor_id"] = None
     alerts = getattr(obj, "alerts", None)
     if alerts is not None:
         payload["alerts_count"] = len(alerts)
@@ -186,23 +188,43 @@ def start_session(
 
     auto_presets: list[SessionPresetValue] = []
     if implement is not None:
-        if implement.preset_speed_kmh is not None:
+        if (
+            implement.preset_speed_kmh is not None
+            or implement.preset_speed_kmh_min is not None
+            or implement.preset_speed_kmh_max is not None
+        ):
             auto_presets.append(
                 SessionPresetValue(
                     session_id=session.id,
                     parameter_name="forward_speed",
-                    required_value=implement.preset_speed_kmh,
+                    required_value=(
+                        implement.preset_speed_kmh_max
+                        if implement.preset_speed_kmh_max is not None
+                        else implement.preset_speed_kmh
+                    ),
+                    required_min=implement.preset_speed_kmh_min,
+                    required_max=implement.preset_speed_kmh_max,
                     unit="km/h",
                     deviation_pct_warn=10.0,
                     deviation_pct_crit=25.0,
                 )
             )
-        if implement.preset_depth_cm is not None:
+        if (
+            implement.preset_depth_cm is not None
+            or implement.preset_depth_cm_min is not None
+            or implement.preset_depth_cm_max is not None
+        ):
             auto_presets.append(
                 SessionPresetValue(
                     session_id=session.id,
                     parameter_name="operation_depth",
-                    required_value=implement.preset_depth_cm,
+                    required_value=(
+                        implement.preset_depth_cm_max
+                        if implement.preset_depth_cm_max is not None
+                        else implement.preset_depth_cm
+                    ),
+                    required_min=implement.preset_depth_cm_min,
+                    required_max=implement.preset_depth_cm_max,
                     unit="cm",
                     deviation_pct_warn=10.0,
                     deviation_pct_crit=25.0,

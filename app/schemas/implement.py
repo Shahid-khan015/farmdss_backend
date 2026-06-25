@@ -25,7 +25,11 @@ class ImplementBase(BaseModel):
     working_width_m: Optional[float] = None
     hitch_type: Optional[str] = None
     preset_speed_kmh: Optional[float] = None
+    preset_speed_kmh_min: Optional[float] = None
+    preset_speed_kmh_max: Optional[float] = None
     preset_depth_cm: Optional[float] = None
+    preset_depth_cm_min: Optional[float] = None
+    preset_depth_cm_max: Optional[float] = None
     preset_gearbox_temp_max_c: Optional[float] = None
 
     is_library: bool = False
@@ -53,7 +57,11 @@ class ImplementUpdate(BaseModel):
     working_width_m: Optional[float] = None
     hitch_type: Optional[str] = None
     preset_speed_kmh: Optional[float] = None
+    preset_speed_kmh_min: Optional[float] = None
+    preset_speed_kmh_max: Optional[float] = None
     preset_depth_cm: Optional[float] = None
+    preset_depth_cm_min: Optional[float] = None
+    preset_depth_cm_max: Optional[float] = None
     preset_gearbox_temp_max_c: Optional[float] = None
 
 

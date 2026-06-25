@@ -30,6 +30,30 @@ def get_latest_per_feed(
     return out
 
 
+def get_two_latest_gps(
+    db: Session,
+    *,
+    device_id: str,
+) -> list[IoTReading]:
+    """Return the two most recent position_tracking rows for a device (newest first).
+
+    Used by the operation interpreter to detect GPS movement between consecutive readings.
+    Returns an empty list if no GPS readings exist yet.
+    """
+    stmt = (
+        select(IoTReading)
+        .where(
+            and_(
+                IoTReading.device_id == device_id,
+                IoTReading.feed_key == "position_tracking",
+            )
+        )
+        .order_by(desc(IoTReading.device_timestamp))
+        .limit(2)
+    )
+    return list(db.scalars(stmt).all())
+
+
 def get_history(
     db: Session,
     *,

@@ -28,6 +28,15 @@ class IotLatestResponse(BaseModel):
     device_id: str
     feeds: list[LatestFeedReading]
 
+    # Tractor operation interpretation — computed from GPS, PTO, vibration feeds
+    interpretation: Optional[str] = None       # Human-readable state label
+    state_key: Optional[str] = None            # Machine-readable key (e.g. "pto_field_work")
+    state_color: Optional[str] = None          # Badge hex colour for UI
+    gps_changed: Optional[bool] = None         # Whether GPS moved between last two readings
+    pto_rotating: Optional[bool] = None        # Whether PTO shaft speed > threshold
+    vibrating: Optional[bool] = None           # Whether vibration > threshold
+    signals_available: bool = False            # False when no signal data was available
+
 
 class IotHistoryItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
