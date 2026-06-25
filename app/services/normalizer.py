@@ -13,16 +13,16 @@ logger = logging.getLogger(__name__)
 
 # Canonical feed keys ↔ Adafruit dashboard feed paths (username segment is env-specific).
 FEEDS: Final[dict[str, str]] = {
-    "soil_moisture": "abhixs/feeds/soil-moisture",
-    "position_tracking": "abhixs/feeds/gpsloc",
-    "forward_speed": "abhixs/feeds/forward-speed",
-    "pto_shaft_speed": "abhixs/feeds/pto-speed",
-    "depth_of_operation": "abhixs/feeds/operation-depth",
-    "machine_status": "abhixs/feeds/machine-status",
-    "gearbox_temperature": "abhixs/feeds/gearbox-temp",
-    "vibration": "abhixs/feeds/vibration-level",
-    "wheel_slip": "abhixs/feeds/wheel-slip",
-    "field_capacity": "abhixs/feeds/field-capacity",
+    "soil_moisture": "soil-moisture",
+    "position_tracking": "gpsloc",
+    "forward_speed": "forward-speed",
+    "pto_shaft_speed": "pto-speed",
+    "depth_of_operation": "operation-depth",
+    "machine_status": "machine-status",
+    "gearbox_temperature": "gearbox-temp",
+    "vibration": "vibration-level",
+    "wheel_slip": "wheel-slip",
+    "field_capacity": "field-capacity",
 }
 
 # Explicit units for dashboard / analytics (not inferred from Adafruit metadata here).
@@ -41,16 +41,16 @@ FEED_UNITS: Final[dict[str, str]] = {
 
 
 def adafruit_slug_for_feed_key(feed_key: str) -> str:
-    path = FEEDS[feed_key]
-    return path.split("/feeds/")[-1]
+    path_or_slug = FEEDS[feed_key]
+    return path_or_slug.split("/feeds/")[-1]
 
 
 def feed_key_from_adafruit_topic_or_slug(topic_or_slug: str) -> Optional[str]:
     """Map `username/feeds/slug` or bare `slug` to our canonical feed_key."""
     slug = topic_or_slug.strip("/").split("/")[-1]
     slug_norm = slug.lower().replace("_", "-")
-    for key, path in FEEDS.items():
-        if path.split("/feeds/")[-1].lower().replace("_", "-") == slug_norm:
+    for key, path_or_slug in FEEDS.items():
+        if path_or_slug.split("/feeds/")[-1].lower().replace("_", "-") == slug_norm:
             return key
     return None
 
