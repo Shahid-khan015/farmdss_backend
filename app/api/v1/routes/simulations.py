@@ -14,22 +14,25 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_db
-from app.core.engineering_validation import (
-    evaluate_simulation_rules,
-    validate_operating_ranges,
+from app.core.combi_algorithms import (
+    ActivePassiveInputs,
+    ActiveRotorInputs,
+    PassivePassiveInputs,
+    PassiveToolInputs,
+    calculate_active_passive_performance,
+    calculate_passive_passive_performance,
 )
-from app.core.performance_calculator import (
-    PerformanceInputs,
-    calculate_performance,
-    estimate_required_draft_power,
-)
+from app.core.engineering_validation import validate_operating_ranges
+from app.core.implement_taxonomy import SlotAssignmentError, is_active, validate_slot_assignment
+from app.core.performance_calculator import PerformanceInputs, calculate_performance
 from app.crud.implement import implement_crud
 from app.crud.operating_condition import operating_condition_crud
 from app.crud.simulation import simulation_crud
 from app.crud.tractor import tractor_crud
 from app.crud.tire_specification import tire_crud
 from app.middleware.auth import get_current_user
-from app.models.enums import SoilTexture
+from app.models.enums import SimulationCombinationType, SoilTexture
+from app.models.implement import Implement
 from app.models.simulation import Simulation
 from app.models.user import User
 from app.schemas.common import DeleteResponse, PaginatedResponse
@@ -265,6 +268,126 @@ def get_simulation(
     return obj
 
 
+def _require_implement_fields(implement: Implement, *, label: str = "Implement") -> None:
+    """Fields a PASSIVE tool needs to run through the DSS draft equation."""
+    required = [
+        ("width", implement.width),
+        ("weight", implement.weight),
+        ("cg_distance_from_hitch", implement.cg_distance_from_hitch),
+        ("asae_param_a", implement.asae_param_a),
+        ("asae_param_b", implement.asae_param_b),
+        ("asae_param_c", implement.asae_param_c),
+    ]
+    missing = [k for k, v in required if v is None]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{label} missing required fields for simulation: {missing}",
+        )
+
+
+# Rotor spec -> (implement column, request field). The request value, when
+# supplied, overrides the catalogue record so existing inline-only payloads and
+# per-run tweaks both keep working.
+_ROTOR_SPEC_FIELDS = (
+    ("rotor_weight", "weight", "rotor_weight"),
+    ("rotor_cg_distance_from_hitch", "cg_distance_from_hitch", "rotor_cg_distance_from_hitch"),
+    ("rotor_mechanical_resistance", "rotor_mechanical_resistance", "rotor_mechanical_resistance"),
+    ("rotor_efficiency", "rotor_efficiency", "rotor_efficiency"),
+    ("rotor_pto_power", "rotor_pto_power", "rotor_pto_power"),
+    ("rotor_speed", "rotor_speed", "rotor_speed"),
+    ("rotor_dynamic_vertical_force", "rotor_dynamic_vertical_force", "rotor_dynamic_vertical_force"),
+)
+
+
+def _resolve_rotor_specs(payload: SimulationRunRequest, rotor_implement: Optional[Implement]) -> dict:
+    """Merge catalogue rotor specs with inline payload overrides.
+
+    The rotor's mass properties come from the implement's own `weight` /
+    `cg_distance_from_hitch`; the four powered specs come from its rotor_*
+    columns. Any value explicitly supplied on the request wins.
+    """
+    resolved: dict = {}
+    for spec_name, implement_attr, payload_attr in _ROTOR_SPEC_FIELDS:
+        value = getattr(payload, payload_attr, None)
+        if value is None and rotor_implement is not None:
+            value = getattr(rotor_implement, implement_attr, None)
+        resolved[spec_name] = value
+
+    # rotor_dynamic_vertical_force (Fv) is optional and defaults to 0.
+    required = [k for k, v in resolved.items() if v is None and k != "rotor_dynamic_vertical_force"]
+    if required:
+        source = (
+            f"the selected rotor implement '{rotor_implement.name}' does not define them "
+            "and they were not supplied in the request"
+            if rotor_implement is not None
+            else "they were not supplied in the request"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Missing rotor specifications for active-passive simulation: {required} — {source}.",
+        )
+    return resolved
+
+
+def _resolve_rolling_radii(tractor, tires) -> tuple[float, float]:
+    front_rr_m = float(tires.front_rolling_radius) / 1000.0 if tires.front_rolling_radius is not None else None
+    rear_rr_m = float(tires.rear_rolling_radius) / 1000.0 if tires.rear_rolling_radius is not None else None
+    if front_rr_m is None:
+        if tires.front_static_loaded_radius is not None:
+            front_rr_m = float(tires.front_static_loaded_radius) / 1000.0
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Tire specs missing front rolling radius (front_rolling_radius/front_static_loaded_radius)",
+            )
+    if rear_rr_m is None:
+        if tires.rear_static_loaded_radius is not None:
+            rear_rr_m = float(tires.rear_static_loaded_radius) / 1000.0
+        elif tractor.rear_wheel_rolling_radius is not None:
+            rear_rr_m = float(tractor.rear_wheel_rolling_radius)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Missing rear rolling radius (tire rear_rolling_radius/rear_static_loaded_radius or tractor rear_wheel_rolling_radius)",
+            )
+    return front_rr_m, rear_rr_m
+
+
+def _resolve_soil_texture(soil_texture) -> SoilTexture:
+    try:
+        return soil_texture if isinstance(soil_texture, SoilTexture) else SoilTexture(str(soil_texture))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid soil_texture '{soil_texture}' for DSS simulation",
+        )
+
+
+def _result_to_decimal_extras(results: dict) -> dict:
+    def d(key: str) -> Optional[Decimal]:
+        value = results.get(key)
+        return Decimal(str(value)) if value is not None else None
+
+    return {
+        "results": results,
+        "draft_force": d("draft_force"),
+        "drawbar_power": d("drawbar_power"),
+        "slip": d("slip"),
+        "traction_efficiency": d("traction_efficiency"),
+        "power_utilization": d("power_utilization"),
+        "field_capacity_theoretical": d("field_capacity_theoretical"),
+        "field_capacity_actual": d("field_capacity_actual"),
+        "field_efficiency": d("field_efficiency"),
+        "fuel_consumption_per_hectare": d("fuel_consumption_per_hectare"),
+        "overall_efficiency": d("overall_efficiency"),
+        "ballast_front_required": d("ballast_front_required"),
+        "ballast_rear_required": d("ballast_rear_required"),
+        "status_message": results.get("status_message"),
+        "recommendations": results.get("recommendations"),
+    }
+
+
 @router.post("/run", response_model=SimulationRead, status_code=status.HTTP_201_CREATED)
 def run_simulation(
     payload: SimulationRunRequest,
@@ -283,6 +406,34 @@ def run_simulation(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Tractor is missing tire specifications",
         )
+
+    # implement_2_id carries tool 2 for a passive-passive pair, or the (optional)
+    # catalogue rotor for an active-passive combination.
+    implement_2 = None
+    if payload.implement_2_id is not None and payload.combination_type in (
+        SimulationCombinationType.PASSIVE_PASSIVE,
+        SimulationCombinationType.ACTIVE_PASSIVE,
+    ):
+        implement_2 = implement_crud.get(db, id=payload.implement_2_id)
+        if not implement_2:
+            label = (
+                "Second implement (implement_2_id) not found"
+                if payload.combination_type == SimulationCombinationType.PASSIVE_PASSIVE
+                else "Rotor implement (implement_2_id) not found"
+            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=label)
+
+    # Enforce the implement taxonomy: which power class may fill which slot.
+    try:
+        validate_slot_assignment(
+            combination_type=payload.combination_type,
+            implement_type=implement.implement_type,
+            implement_2_type=implement_2.implement_type if implement_2 is not None else None,
+            implement_id=payload.implement_id,
+            implement_2_id=payload.implement_2_id,
+        )
+    except SlotAssignmentError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
     # Resolve operating conditions
     if payload.operating_conditions_preset_id is not None:
@@ -328,21 +479,15 @@ def run_simulation(
             detail=f"Tractor missing required fields for simulation: {missing_tractor}",
         )
 
-    required_impl = [
-        ("width", implement.width),
-        ("weight", implement.weight),
-        ("cg_distance_from_hitch", implement.cg_distance_from_hitch),
-        ("vertical_horizontal_ratio", implement.vertical_horizontal_ratio),
-        ("asae_param_a", implement.asae_param_a),
-        ("asae_param_b", implement.asae_param_b),
-        ("asae_param_c", implement.asae_param_c),
-    ]
-    missing_impl = [k for k, v in required_impl if v is None]
-    if missing_impl:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Implement missing required fields for simulation: {missing_impl}",
-        )
+    is_rotor_implement = implement_2 is not None and is_active(implement_2.implement_type)
+    _require_implement_fields(
+        implement,
+        label="Implement" if implement_2 is None or is_rotor_implement else "Implement 1",
+    )
+    # A rotor implement is NOT validated against the passive-draft field set --
+    # it has no meaningful ASAE A/B/C. Its specs are checked by _resolve_rotor_specs.
+    if implement_2 is not None and not is_rotor_implement:
+        _require_implement_fields(implement_2, label="Implement 2")
 
     required_cond = [
         ("soil_texture", soil_texture),
@@ -372,44 +517,39 @@ def run_simulation(
             detail=f"Tire specs missing required fields for legacy simulation: {missing_tires}",
         )
 
-    front_rr_m = (
-        float(tires.front_rolling_radius) / 1000.0
-        if tires.front_rolling_radius is not None
-        else None
-    )
-    rear_rr_m = (
-        float(tires.rear_rolling_radius) / 1000.0
-        if tires.rear_rolling_radius is not None
-        else None
-    )
-    if front_rr_m is None:
-        if tires.front_static_loaded_radius is not None:
-            front_rr_m = float(tires.front_static_loaded_radius) / 1000.0
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Tire specs missing front rolling radius (front_rolling_radius/front_static_loaded_radius)",
-            )
-    if rear_rr_m is None:
-        if tires.rear_static_loaded_radius is not None:
-            rear_rr_m = float(tires.rear_static_loaded_radius) / 1000.0
-        elif tractor.rear_wheel_rolling_radius is not None:
-            rear_rr_m = float(tractor.rear_wheel_rolling_radius)
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Missing rear rolling radius (tire rear_rolling_radius/rear_static_loaded_radius or tractor rear_wheel_rolling_radius)",
-            )
+    front_rr_m, rear_rr_m = _resolve_rolling_radii(tractor, tires)
+    soil_texture_enum = _resolve_soil_texture(soil_texture)
 
-    try:
-        soil_texture_enum = soil_texture if isinstance(soil_texture, SoilTexture) else SoilTexture(str(soil_texture))
-    except ValueError:
+    # Validate operating-range business rules (speed/depth/cone-index/pto-power are
+    # tractor/condition-level; implement_width is checked per implement below).
+    base_range_errors = validate_operating_ranges(
+        {
+            "speed": speed,
+            "depth": depth,
+            "cone_index": cone_index,
+            "implement_width": implement.width,
+            "pto_power": tractor.pto_power,
+        }
+    )
+    width_range_errors = []
+    # Only a passive tool 2 is width-checked: a rotor's working width is not an
+    # input to the DSS passive-draft model, and may legitimately be absent.
+    if implement_2 is not None and not is_rotor_implement:
+        width_range_errors = [
+            e
+            for e in validate_operating_ranges(
+                {"speed": speed, "depth": depth, "cone_index": cone_index, "implement_width": implement_2.width, "pto_power": tractor.pto_power}
+            )
+            if e["field"] == "implement_width"
+        ]
+    validation_errors = base_range_errors + width_range_errors
+    if validation_errors:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid soil_texture '{soil_texture}' for legacy DSS",
+            detail={"status": "validation_failed", "errors": validation_errors},
         )
 
-    perf_inputs = PerformanceInputs(
+    tractor_kwargs = dict(
         pto_power_kw=float(tractor.pto_power),
         wheelbase_m=float(tractor.wheelbase),
         front_axle_weight_kg=float(tractor.front_axle_weight),
@@ -424,129 +564,99 @@ def run_simulation(
         rear_overall_diameter_m=float(tires.rear_overall_diameter) / 1000.0,
         front_section_width_m=float(tires.front_section_width) / 1000.0,
         rear_section_width_m=float(tires.rear_section_width) / 1000.0,
-        implement_type=implement.implement_type,
-        width_m=float(implement.width),
-        weight_kg=float(implement.weight),
-        cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
-        vertical_horizontal_ratio=float(implement.vertical_horizontal_ratio),
-        asae_param_a=float(implement.asae_param_a),
-        asae_param_b=float(implement.asae_param_b),
-        asae_param_c=float(implement.asae_param_c),
         soil_texture=soil_texture_enum,
         cone_index_kpa=float(cone_index),
         depth_cm=float(depth),
         speed_kmh=float(speed),
         field_area_ha=float(field_area),
         field_width_m=float(field_width),
+        # Optional: enables the DSS Eq. 3.4 engine-torque pull limit (Pet)
+        # diagnostic. Left as None when the tractor record has no torque figure.
+        max_engine_torque_nm=(
+            float(tractor.max_engine_torque) if tractor.max_engine_torque is not None else None
+        ),
     )
-    validation_errors = validate_operating_ranges(
-        {
-            "speed": speed,
-            "depth": depth,
-            "cone_index": cone_index,
-            "implement_width": implement.width,
-            "pto_power": tractor.pto_power,
-        }
-    )
-    if validation_errors:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "status": "validation_failed",
-                "errors": validation_errors,
-            },
-        )
 
-    draft_force, required_power_kw = estimate_required_draft_power(perf_inputs)
-    available_power_kw = (
-        float(tractor.pto_power)
-        * (float(tractor.transmission_efficiency) / 100.0)
-        * ((100.0 - float(tractor.power_reserve)) / 100.0)
+    rotor_specs = (
+        _resolve_rotor_specs(payload, implement_2 if is_rotor_implement else None)
+        if payload.combination_type == SimulationCombinationType.ACTIVE_PASSIVE
+        else None
     )
-    power_limit_kw = available_power_kw * 0.85
-    if required_power_kw > power_limit_kw:
-        power_utilization = (required_power_kw / available_power_kw) * 100.0 if available_power_kw > 0 else None
-        recommendation = "Implement exceeds tractor capability. Reduce tillage depth, reduce implement width, or increase tractor HP."
-        results = {
-            "draft_force": draft_force,
-            "drawbar_power": required_power_kw,
-            "power_utilization": power_utilization,
-            "status": "Not Recommended",
-            "warnings": ["Implement load exceeds tractor safe operating capability."],
-            "confidence": "Low",
-            "recommendation_messages": [
-                "Reduce operating depth",
-                "Reduce implement width",
-                "Increase tractor HP",
-            ],
-            "status_message": "Implement exceeds tractor capability.",
-            "recommendations": recommendation,
-            "load_status": "Over Loaded",
-            "compatibility": {
-                "required_power_kw": required_power_kw,
-                "available_power_kw": available_power_kw,
-                "safe_limit_kw": power_limit_kw,
-                "recommended_action": recommendation,
-            },
-            "calculation_mode": "legacy_vb_guarded",
-        }
-        logger.warning(
-            "simulation.compatibility_failure",
-            extra={
-                "tractor_id": str(tractor.id),
-                "implement_id": str(implement.id),
-                "draft_force_n": draft_force,
-                "required_power_kw": required_power_kw,
-                "available_power_kw": available_power_kw,
-                "power_utilization_pct": power_utilization,
-            },
-        )
-        sim = simulation_crud.create(
-            db,
-            obj_in=payload,
-            extra={
-                "operating_conditions_preset_id": payload.operating_conditions_preset_id,
-                "cone_index": cone_index,
-                "depth": depth,
-                "speed": speed,
-                "field_area": field_area,
-                "field_length": field_length,
-                "field_width": field_width,
-                "number_of_turns": number_of_turns,
-                "soil_texture": soil_texture,
-                "soil_hardness": soil_hardness,
-                "results": results,
-                "draft_force": Decimal(str(draft_force)),
-                "drawbar_power": Decimal(str(required_power_kw)),
-                "power_utilization": Decimal(str(power_utilization)) if power_utilization is not None else None,
-                "status_message": results["status_message"],
-                "recommendations": recommendation,
-            },
-        )
-        return sim
 
+    # Note: the engine itself already handles infeasible operating points
+    # gracefully -- it caps slip at the 20% engineering limit, marks the result
+    # unconverged/low-confidence, and reports power_utilization per the DSS
+    # "Check Put value" table (>100% => "Tractor is Overloaded"). A separate
+    # pre-emptive short-circuit here would reject results in the DSS-defined
+    # 85-100% "properly loaded" band before the engine ever ran, so we always
+    # run the full calculation and let it speak for itself.
     try:
-        results = calculate_performance(perf_inputs)
-    except (ValueError, ZeroDivisionError) as exc:
+        if payload.combination_type == SimulationCombinationType.PASSIVE_PASSIVE:
+            results = calculate_passive_passive_performance(
+                PassivePassiveInputs(
+                    **tractor_kwargs,
+                    tool_1=PassiveToolInputs(
+                        implement_type=implement.implement_type,
+                        width_m=float(implement.width),
+                        weight_kg=float(implement.weight),
+                        cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
+                        asae_param_a=float(implement.asae_param_a),
+                        asae_param_b=float(implement.asae_param_b),
+                        asae_param_c=float(implement.asae_param_c),
+                    ),
+                    tool_2=PassiveToolInputs(
+                        implement_type=implement_2.implement_type,
+                        width_m=float(implement_2.width),
+                        weight_kg=float(implement_2.weight),
+                        cg_distance_from_hitch_m=float(implement_2.cg_distance_from_hitch),
+                        asae_param_a=float(implement_2.asae_param_a),
+                        asae_param_b=float(implement_2.asae_param_b),
+                        asae_param_c=float(implement_2.asae_param_c),
+                    ),
+                    interaction_coefficient=float(payload.interaction_coefficient),
+                )
+            )
+        elif payload.combination_type == SimulationCombinationType.ACTIVE_PASSIVE:
+            results = calculate_active_passive_performance(
+                ActivePassiveInputs(
+                    **tractor_kwargs,
+                    passive_tool=PassiveToolInputs(
+                        implement_type=implement.implement_type,
+                        width_m=float(implement.width),
+                        weight_kg=float(implement.weight),
+                        cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
+                        asae_param_a=float(implement.asae_param_a),
+                        asae_param_b=float(implement.asae_param_b),
+                        asae_param_c=float(implement.asae_param_c),
+                    ),
+                    rotor=ActiveRotorInputs(
+                        weight_kg=float(rotor_specs["rotor_weight"]),
+                        cg_distance_from_hitch_m=float(rotor_specs["rotor_cg_distance_from_hitch"]),
+                        mechanical_resistance_n=float(rotor_specs["rotor_mechanical_resistance"]),
+                        rotor_efficiency=float(rotor_specs["rotor_efficiency"]),
+                        pto_power_draw_kw=float(rotor_specs["rotor_pto_power"]),
+                        rotor_speed_rpm=float(rotor_specs["rotor_speed"]),
+                        dynamic_vertical_force_n=float(rotor_specs["rotor_dynamic_vertical_force"] or 0.0),
+                    ),
+                )
+            )
+        else:
+            perf_inputs = PerformanceInputs(
+                **tractor_kwargs,
+                implement_type=implement.implement_type,
+                width_m=float(implement.width),
+                weight_kg=float(implement.weight),
+                cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
+                vertical_horizontal_ratio=float(implement.vertical_horizontal_ratio or 0.0),
+                asae_param_a=float(implement.asae_param_a),
+                asae_param_b=float(implement.asae_param_b),
+                asae_param_c=float(implement.asae_param_c),
+            )
+            results = calculate_performance(perf_inputs)
+    # KeyError is included as a backstop: any implement-keyed lookup that somehow
+    # escapes slot validation should surface as an actionable 422, never a 500.
+    except (ValueError, ZeroDivisionError, KeyError) as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-
-    rule_evaluation = evaluate_simulation_rules(
-        slip=results.get("slip"),
-        coefficient_net_traction=results.get("coefficient_net_traction"),
-        front_weight_utilization=results.get("front_weight_utilization"),
-        power_utilization=results.get("power_utilization"),
-        soil_texture=soil_texture_enum,
-    )
-
-    if not rule_evaluation["compatible"]:
-        results["status"] = "Not Recommended"
-        results["status_message"] = "Not Recommended"
-        results["warnings"] = list({*results.get("warnings", []), *rule_evaluation.get("warnings", [])})
-        recommendations = list(dict.fromkeys(
-            (results.get("recommendation_messages") or []) + rule_evaluation.get("recommendations", [])
-        ))
-        results["recommendations"] = "; ".join(recommendations)
-        results["recommendation_messages"] = recommendations
 
     # Persist simulation + key result columns
     sim = simulation_crud.create(
@@ -563,21 +673,7 @@ def run_simulation(
             "number_of_turns": int(results.get("legacy_number_of_turns")) if results.get("legacy_number_of_turns") is not None else number_of_turns,
             "soil_texture": soil_texture,
             "soil_hardness": soil_hardness,
-            "results": results,
-            "draft_force": Decimal(str(results.get("draft_force"))) if results.get("draft_force") is not None else None,
-            "drawbar_power": Decimal(str(results.get("drawbar_power"))) if results.get("drawbar_power") is not None else None,
-            "slip": Decimal(str(results.get("slip"))) if results.get("slip") is not None else None,
-            "traction_efficiency": Decimal(str(results.get("traction_efficiency"))) if results.get("traction_efficiency") is not None else None,
-            "power_utilization": Decimal(str(results.get("power_utilization"))) if results.get("power_utilization") is not None else None,
-            "field_capacity_theoretical": Decimal(str(results.get("field_capacity_theoretical"))) if results.get("field_capacity_theoretical") is not None else None,
-            "field_capacity_actual": Decimal(str(results.get("field_capacity_actual"))) if results.get("field_capacity_actual") is not None else None,
-            "field_efficiency": Decimal(str(results.get("field_efficiency"))) if results.get("field_efficiency") is not None else None,
-            "fuel_consumption_per_hectare": Decimal(str(results.get("fuel_consumption_per_hectare"))) if results.get("fuel_consumption_per_hectare") is not None else None,
-            "overall_efficiency": Decimal(str(results.get("overall_efficiency"))) if results.get("overall_efficiency") is not None else None,
-            "ballast_front_required": Decimal(str(results.get("ballast_front_required"))) if results.get("ballast_front_required") is not None else None,
-            "ballast_rear_required": Decimal(str(results.get("ballast_rear_required"))) if results.get("ballast_rear_required") is not None else None,
-            "status_message": results.get("status_message"),
-            "recommendations": results.get("recommendations"),
+            **_result_to_decimal_extras(results),
         },
     )
     return sim

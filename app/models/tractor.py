@@ -62,6 +62,5 @@ class Tractor(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         "OperationSession",
         back_populates="tractor",
         foreign_keys="OperationSession.tractor_id",
-        passive_deletes=True,
     )
 

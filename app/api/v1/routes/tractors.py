@@ -4,7 +4,6 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -12,7 +11,6 @@ from app.crud.simulation import simulation_crud
 from app.crud.tractor import tractor_crud
 from app.crud.tire_specification import tire_crud
 from app.middleware.auth import get_current_user, require_role
-from app.models.session import OperationSession
 from app.models.user import User
 from app.schemas.common import DeleteResponse, PaginatedResponse
 from app.schemas.implement import ImplementRead
@@ -48,6 +46,7 @@ def list_tractors(
         manufacturer=manufacturer,
         drive_mode=drive_mode,
         is_library=effective_is_library,
+        current_user_id=current_user.id,
         sort=sort,
         limit=limit,
         offset=offset,
@@ -106,6 +105,13 @@ def update_tractor(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Library tractors cannot be modified",
         )
+    # owner_id is None for a handful of legacy rows predating ownership
+    # enforcement; treat those as still editable rather than locking them out.
+    if tractor.owner_id is not None and tractor.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify your own tractors",
+        )
     tractor_crud.update(db, db_obj=tractor, obj_in=payload)
     return tractor_crud.get_with_tires(db, id=id)
 
@@ -124,10 +130,12 @@ def delete_tractor(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Library tractors cannot be deleted",
         )
-
-    deleted_obj = tractor_crud.remove(db, id=id)
-    if deleted_obj is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tractor not found")
+    if obj.owner_id is not None and obj.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own tractors",
+        )
+    tractor_crud.remove(db, id=id)
     return {"ok": True, "id": id}
 
 

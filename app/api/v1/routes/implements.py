@@ -20,7 +20,7 @@ router = APIRouter()
 
 @router.get("", response_model=PaginatedResponse[ImplementRead])
 def list_implements(
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     q: Optional[str] = Query(default=None),
     implement_type: Optional[str] = Query(default=None),
@@ -36,6 +36,7 @@ def list_implements(
         implement_type=implement_type,
         manufacturer=manufacturer,
         is_library=is_library,
+        current_user_id=current_user.id,
         sort=sort,
         limit=limit,
         offset=offset,
@@ -58,34 +59,60 @@ def get_implement(
 @router.post("", response_model=ImplementRead, status_code=status.HTTP_201_CREATED)
 def create_implement(
     payload: ImplementCreate,
-    _: User = Depends(require_role(["owner"])),
+    current_user: User = Depends(require_role(["owner"])),
     db: Session = Depends(get_db),
 ):
-    return implement_crud.create(db, obj_in=payload)
+    # Previously missing entirely, so every custom implement was created with
+    # owner_id=NULL and was therefore visible to (and editable by) every user.
+    extra = {"owner_id": current_user.id}
+    return implement_crud.create(db, obj_in=payload, extra=extra)
 
 
 @router.put("/{id}", response_model=ImplementRead)
 def update_implement(
     id: uuid.UUID,
     payload: ImplementUpdate,
-    _: User = Depends(require_role(["owner"])),
+    current_user: User = Depends(require_role(["owner"])),
     db: Session = Depends(get_db),
 ):
     obj = implement_crud.get(db, id=id)
     if not obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Implement not found")
+    if obj.is_library:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Library implements cannot be modified",
+        )
+    # owner_id is None for legacy rows created before ownership was enforced on
+    # this endpoint; treat those as still editable rather than locking them out.
+    if obj.owner_id is not None and obj.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify your own implements",
+        )
     return implement_crud.update(db, db_obj=obj, obj_in=payload)
 
 
 @router.delete("/{id}", response_model=DeleteResponse)
 def delete_implement(
     id: uuid.UUID,
-    _: User = Depends(require_role(["owner"])),
+    current_user: User = Depends(require_role(["owner"])),
     db: Session = Depends(get_db),
 ):
-    obj = implement_crud.remove(db, id=id)
+    obj = implement_crud.get(db, id=id)
     if not obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Implement not found")
+    if obj.is_library:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Library implements cannot be deleted",
+        )
+    if obj.owner_id is not None and obj.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own implements",
+        )
+    implement_crud.remove(db, id=id)
     return {"ok": True, "id": id}
 
 

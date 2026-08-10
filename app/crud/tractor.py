@@ -28,10 +28,20 @@ class CRUDTractor(CRUDBase[Tractor, TractorCreate, TractorUpdate]):
         manufacturer: Optional[str] = None,
         drive_mode: Optional[str] = None,
         is_library: Optional[bool] = None,
+        current_user_id: Optional[uuid.UUID] = None,
         sort: str = "name",
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[Tractor]]:
+        """List tractors.
+
+        Library tractors (is_library=True) are shared reference data visible to
+        everyone. Custom tractors are private to their owner: when
+        `current_user_id` is given, any non-library row is only returned if it
+        belongs to that user -- otherwise every user's custom copies would leak
+        into every other user's "My Tractors" list (this previously showed up
+        as apparent "duplicate" library entries).
+        """
         stmt = select(Tractor).options(selectinload(Tractor.tire_specification))
 
         if q:
@@ -43,6 +53,8 @@ class CRUDTractor(CRUDBase[Tractor, TractorCreate, TractorUpdate]):
             stmt = stmt.where(Tractor.drive_mode == drive_mode)
         if is_library is not None:
             stmt = stmt.where(Tractor.is_library == is_library)
+        if current_user_id is not None:
+            stmt = stmt.where(or_(Tractor.is_library == True, Tractor.owner_id == current_user_id))  # noqa: E712
 
         if sort == "power":
             stmt = stmt.order_by(Tractor.pto_power.desc().nullslast(), Tractor.name.asc())

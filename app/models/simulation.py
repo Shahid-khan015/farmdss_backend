@@ -4,10 +4,11 @@ import uuid
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DECIMAL, JSON, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import DECIMAL, JSON, Enum, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.enums import SimulationCombinationType
 from app.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
 
 
@@ -22,6 +23,10 @@ class Simulation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
         index=True,
     )
+    # Single mode: the implement. Passive-passive mode: tool 1 (leading tool).
+    # Active-passive mode: the passive (towed) tool; the rotor is not a catalog
+    # Implement (see rotor_* columns below) since the DSS document specifies it
+    # via ad hoc numeric specs (torque/speed/efficiency), not ASAE draft params.
     implement_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("implements.id", ondelete="CASCADE"),
@@ -34,6 +39,40 @@ class Simulation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=True,
         index=True,
     )
+
+    combination_type: Mapped[SimulationCombinationType] = mapped_column(
+        # `values_callable` persists the enum *values* ("single", "passive_passive",
+        # "active_passive") rather than SQLAlchemy's default of member *names*.
+        # The migration creates the Postgres type from the values, the API schema
+        # validates against the values, and `server_default` below is a value — so
+        # without this the ORM writes "SINGLE" into a type that only accepts "single".
+        Enum(
+            SimulationCombinationType,
+            name="simulation_combination_type",
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=SimulationCombinationType.SINGLE,
+        server_default=SimulationCombinationType.SINGLE.value,
+    )
+
+    # --- Passive-passive combination (DSS Section 4) ---
+    implement_2_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("implements.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    interaction_coefficient: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # ki, 0.00-0.25
+
+    # --- Active-passive combination (DSS Section 5): PTO-driven rotor specs ---
+    rotor_weight: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # kg
+    rotor_cg_distance_from_hitch: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # m
+    rotor_mechanical_resistance: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # Da, N
+    rotor_efficiency: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # eta_r, 0.25-0.45
+    rotor_pto_power: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # P_PTO, kW
+    rotor_speed: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # N, rpm
+    rotor_dynamic_vertical_force: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # Fv, N
 
     # Custom operating conditions (if preset not used):
     cone_index: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # kPa
@@ -65,7 +104,8 @@ class Simulation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     recommendations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     tractor: Mapped["Tractor"] = relationship(back_populates="simulations")
-    implement: Mapped["Implement"] = relationship(back_populates="simulations")
+    implement: Mapped["Implement"] = relationship(back_populates="simulations", foreign_keys=[implement_id])
+    implement_2: Mapped[Optional["Implement"]] = relationship(foreign_keys=[implement_2_id])
     preset: Mapped[Optional["OperatingConditionPreset"]] = relationship(
         back_populates="simulations"
     )

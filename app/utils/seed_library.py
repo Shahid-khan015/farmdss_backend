@@ -476,6 +476,7 @@ def seed_library_if_empty(db: Session) -> None:
                 "asae_param_b": 25,
                 "asae_param_c": 4,
             },
+            *ACTIVE_LIBRARY_IMPLEMENTS,
         ]
 
         # Add all implements
@@ -484,4 +485,71 @@ def seed_library_if_empty(db: Session) -> None:
             db.add(implement)
 
     db.commit()
+
+
+# --- Active (PTO-powered) library implements ---------------------------------
+# These occupy the rotor slot of an active-passive combination. They carry NO
+# ASAE draft parameters by design: the DSS active-passive model derives the
+# rotor's contribution from its own specs (Da, eta_r, P_PTO, N), never from the
+# passive draft equation.
+#
+# NOTE: like the passive A/B/C values above, these rotor specs are
+# REPRESENTATIVE PLACEHOLDER catalogue data for demo purposes, not
+# manufacturer-published figures. Calibrate against real equipment data sheets
+# before relying on absolute results.
+ACTIVE_LIBRARY_IMPLEMENTS = [
+    {
+        "name": "Rotavator (5 ft)",
+        "manufacturer": "Standard",
+        "implement_type": ImplementType.ROTAVATOR,
+        "width": 1.5,
+        "weight": 380,
+        "cg_distance_from_hitch": 0.45,
+        "rotor_mechanical_resistance": 300,
+        "rotor_efficiency": 0.30,
+        "rotor_pto_power": 3.0,
+        "rotor_speed": 540,
+    },
+    {
+        "name": "Rotavator (7 ft)",
+        "manufacturer": "Heavy Duty",
+        "implement_type": ImplementType.ROTAVATOR,
+        "width": 2.1,
+        "weight": 520,
+        "cg_distance_from_hitch": 0.5,
+        "rotor_mechanical_resistance": 420,
+        "rotor_efficiency": 0.32,
+        "rotor_pto_power": 4.5,
+        "rotor_speed": 540,
+    },
+    {
+        "name": "Powered Disc Harrow (20 Discs)",
+        "manufacturer": "Standard",
+        "implement_type": ImplementType.DISC_HARROW_POWERED,
+        "width": 1.8,
+        "weight": 410,
+        "cg_distance_from_hitch": 0.44,
+        "rotor_mechanical_resistance": 350,
+        "rotor_efficiency": 0.28,
+        "rotor_pto_power": 3.5,
+        "rotor_speed": 540,
+    },
+    {
+        "name": "Powered Cultivator (11 Tines)",
+        "manufacturer": "Standard",
+        "implement_type": ImplementType.CULTIVATOR_POWERED,
+        "width": 1.6,
+        "weight": 330,
+        "cg_distance_from_hitch": 0.4,
+        "rotor_mechanical_resistance": 280,
+        "rotor_efficiency": 0.27,
+        "rotor_pto_power": 3.0,
+        "rotor_speed": 540,
+    },
+]
+
+
+# Existing installations receive these via the idempotent top-up in migration
+# i4j5k6l7m8n9 (seed_library_if_empty only fires on a database with zero
+# library implements, so it would never reach them).
 

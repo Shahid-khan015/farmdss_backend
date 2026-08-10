@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.models.enums import SimulationCombinationType
 from app.schemas.common import Timestamped, UUIDResponse
 
 
@@ -15,12 +16,31 @@ class SimulationRunRequest(BaseModel):
 
     If operating_conditions_preset_id is provided, operating conditions are taken from that preset.
     Otherwise, custom operating conditions must be provided.
+
+    combination_type selects which DSS simulation mode to run:
+      - "single" (default): implement_id is the one implement used.
+      - "passive_passive": implement_id is tool 1, implement_2_id is tool 2 (both
+        towed/passive), interaction_coefficient (ki, 0.00-0.25) is required.
+      - "active_passive": implement_id is the towed passive tool, and the rotor_*
+        fields describe the PTO-driven active rotor unit.
     """
 
     name: Optional[str] = None
     tractor_id: uuid.UUID
     implement_id: uuid.UUID
     operating_conditions_preset_id: Optional[uuid.UUID] = None
+
+    combination_type: SimulationCombinationType = SimulationCombinationType.SINGLE
+    implement_2_id: Optional[uuid.UUID] = None
+    interaction_coefficient: Optional[Decimal] = Field(default=None, ge=0, le=0.25)
+
+    rotor_weight: Optional[Decimal] = Field(default=None, gt=0)
+    rotor_cg_distance_from_hitch: Optional[Decimal] = Field(default=None, ge=0)
+    rotor_mechanical_resistance: Optional[Decimal] = Field(default=None, ge=0)
+    rotor_efficiency: Optional[Decimal] = Field(default=None, ge=0.25, le=0.45)
+    rotor_pto_power: Optional[Decimal] = Field(default=None, gt=0)
+    rotor_speed: Optional[Decimal] = Field(default=None, gt=0)
+    rotor_dynamic_vertical_force: Optional[Decimal] = Field(default=None)
 
     # Custom conditions
     cone_index: Optional[Decimal] = Field(default=None, ge=0)
@@ -35,21 +55,54 @@ class SimulationRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_preset_or_custom(self) -> "SimulationRunRequest":
-        if self.operating_conditions_preset_id is not None:
-            return self
-        required = [
-            ("cone_index", self.cone_index),
-            ("depth", self.depth),
-            ("speed", self.speed),
-            ("field_area", self.field_area),
-            ("field_length", self.field_length),
-            ("field_width", self.field_width),
-        ]
-        missing = [k for k, v in required if v is None]
-        if missing:
-            raise ValueError(
-                f"Custom operating conditions required when no preset is used. Missing: {missing}"
-            )
+        if self.operating_conditions_preset_id is None:
+            required = [
+                ("cone_index", self.cone_index),
+                ("depth", self.depth),
+                ("speed", self.speed),
+                ("field_area", self.field_area),
+                ("field_length", self.field_length),
+                ("field_width", self.field_width),
+            ]
+            missing = [k for k, v in required if v is None]
+            if missing:
+                raise ValueError(
+                    f"Custom operating conditions required when no preset is used. Missing: {missing}"
+                )
+
+        # combination_type is already constrained by the enum itself; no string
+        # allow-list is duplicated here (an extra literal list would silently
+        # reject any future enum member).
+        if self.combination_type == SimulationCombinationType.PASSIVE_PASSIVE:
+            if self.implement_2_id is None:
+                raise ValueError("implement_2_id is required for combination_type=passive_passive")
+            if self.interaction_coefficient is None:
+                raise ValueError(
+                    "interaction_coefficient (ki, 0.00-0.25) is required for combination_type=passive_passive"
+                )
+
+        if self.combination_type == SimulationCombinationType.ACTIVE_PASSIVE:
+            # The rotor may be selected from the implement catalogue via
+            # implement_2_id, in which case its specs are resolved server-side
+            # and any inline rotor_* value simply overrides that record's value.
+            # Inline values remain REQUIRED when no catalogue rotor is chosen,
+            # preserving the original API contract.
+            if self.implement_2_id is None:
+                required_rotor = [
+                    ("rotor_weight", self.rotor_weight),
+                    ("rotor_cg_distance_from_hitch", self.rotor_cg_distance_from_hitch),
+                    ("rotor_mechanical_resistance", self.rotor_mechanical_resistance),
+                    ("rotor_efficiency", self.rotor_efficiency),
+                    ("rotor_pto_power", self.rotor_pto_power),
+                    ("rotor_speed", self.rotor_speed),
+                ]
+                missing_rotor = [k for k, v in required_rotor if v is None]
+                if missing_rotor:
+                    raise ValueError(
+                        "Rotor fields required for combination_type=active_passive when no rotor "
+                        f"implement (implement_2_id) is selected. Missing: {missing_rotor}"
+                    )
+
         return self
 
 
@@ -60,6 +113,17 @@ class SimulationRead(UUIDResponse, Timestamped, BaseModel):
     tractor_id: uuid.UUID
     implement_id: uuid.UUID
     operating_conditions_preset_id: Optional[uuid.UUID] = None
+
+    combination_type: SimulationCombinationType = SimulationCombinationType.SINGLE
+    implement_2_id: Optional[uuid.UUID] = None
+    interaction_coefficient: Optional[Decimal] = None
+    rotor_weight: Optional[Decimal] = None
+    rotor_cg_distance_from_hitch: Optional[Decimal] = None
+    rotor_mechanical_resistance: Optional[Decimal] = None
+    rotor_efficiency: Optional[Decimal] = None
+    rotor_pto_power: Optional[Decimal] = None
+    rotor_speed: Optional[Decimal] = None
+    rotor_dynamic_vertical_force: Optional[Decimal] = None
 
     cone_index: Optional[Decimal] = None
     depth: Optional[Decimal] = None
