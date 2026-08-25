@@ -1,0 +1,32 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local SQLite dev database (Render uses Postgres via DATABASE_URL)
+*.db
+*.sqlite
+*.sqlite3
+
+# Environments / secrets
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+ENV/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
