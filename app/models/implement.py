@@ -4,7 +4,7 @@ import uuid
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import BOOLEAN, DECIMAL, Column, Enum, Float, ForeignKey, String, Uuid
+from sqlalchemy import BOOLEAN, DECIMAL, Column, Enum, Float, ForeignKey, Integer, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -31,6 +31,12 @@ class Implement(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     asae_param_a: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)
     asae_param_b: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)
     asae_param_c: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)
+
+    # ASABE D497 tabulates some implement classes per tool rather than per metre
+    # of width, so Eq. 3.1's `W` is the tool count for those. Populated for
+    # cultivators; ignored for full-width tools. See
+    # `app.core.constants.DRAFT_WIDTH_IS_TOOL_COUNT`.
+    number_of_tools: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     working_width_m = Column(Float, nullable=True)
     hitch_type = Column(String(30), nullable=True)
     preset_speed_kmh = Column(Float, nullable=True)

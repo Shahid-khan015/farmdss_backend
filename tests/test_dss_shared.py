@@ -13,7 +13,6 @@ import pytest
 from app.core.constants import (
     DIESEL_CALORIFIC_VALUE,
     FIELD_EFFICIENCY_CLAMP,
-    FUEL_L_PER_HA_CLAMP,
 )
 from app.core.dss_shared import (
     draft_force_n,
@@ -71,14 +70,18 @@ def test_safe_sqrt_rejects_negative_radicand():
 
 
 def test_draft_force_matches_dss_equation_3_1():
-    # D = F*(A + B*S + C*S^2)*W*(T/10)
+    # D = F*(A + B*S + C*S^2)*W*T -- no divisor on T. W in m, T in cm, D in N.
+    # A=652, B=0, C=5.1 with F=0.70 is the ASABE D497 moldboard-plough row and its
+    # medium-texture F2, so this doubles as a check against the published model:
+    # a 2 m plough at 15 cm must need ~15.4 kN, not ~1.5 kN.
     fi, a, b, c, s, w, t = 0.70, 652.0, 0.0, 5.1, 4.0, 2.0, 15.0
-    expected = fi * (a + b * s + c * s * s) * w * (t / 10.0)
+    expected = fi * (a + b * s + c * s * s) * w * t
     got = draft_force_n(
         fi=fi, asae_param_a=a, asae_param_b=b, asae_param_c=c, speed_kmh=s, width_m=w, depth_cm=t
     )
     assert got == pytest.approx(expected)
-    assert got == pytest.approx(0.70 * (652.0 + 5.1 * 16.0) * 2.0 * 1.5)
+    assert got == pytest.approx(0.70 * (652.0 + 5.1 * 16.0) * 2.0 * 15.0)
+    assert got == pytest.approx(15405.6)
 
 
 def test_draft_force_is_linear_in_width_and_depth_and_quadratic_in_speed():
@@ -223,9 +226,15 @@ def test_overall_efficiency_uses_the_centralised_calorific_value():
     assert p.overall_pct == pytest.approx(expected)
 
 
-def test_fuel_per_hectare_is_clamped():
+def test_fuel_per_hectare_is_floored_but_never_capped():
+    """Both reference implementations report the raw L/h ÷ ha/h ratio.
+
+    An earlier 200 L/ha cap disguised genuinely over-worked pairings behind a
+    plausible-looking number; only the floor at 0 survives.
+    """
     p = power_and_fuel(**dict(POWER_KW, draft_n=400000.0, fc_ac=0.01))
-    assert p.fuel_l_per_ha == pytest.approx(FUEL_L_PER_HA_CLAMP[1])
+    assert p.fuel_l_per_ha == pytest.approx(p.fuel_lph / 0.01)
+    assert p.fuel_l_per_ha > 200.0
 
 
 def test_power_and_fuel_rejects_invalid_inputs():

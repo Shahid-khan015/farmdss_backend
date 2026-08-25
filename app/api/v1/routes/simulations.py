@@ -23,6 +23,7 @@ from app.core.combi_algorithms import (
     calculate_passive_passive_performance,
 )
 from app.core.engineering_validation import validate_operating_ranges
+from app.core.legacy_algorithms import draft_width_is_tool_count
 from app.core.implement_taxonomy import SlotAssignmentError, is_active, validate_slot_assignment
 from app.core.performance_calculator import PerformanceInputs, calculate_performance
 from app.crud.implement import implement_crud
@@ -46,6 +47,17 @@ def _fmt_decimal(value: Optional[Decimal], precision: int = 2) -> str:
     if value is None:
         return ""
     return f"{float(value):.{precision}f}"
+
+
+def _opt_float(value) -> Optional[float]:
+    """Nullable DECIMAL column -> float, preserving None.
+
+    Used for `Implement.vertical_horizontal_ratio` (Py/D), which is nullable: a
+    missing value must reach the engine as None so it falls back to the per-type
+    table rather than being coerced to 0.0, which would zero the vertical soil
+    reaction entirely.
+    """
+    return None if value is None else float(value)
 
 
 def _build_simulation_csv_bytes(
@@ -278,6 +290,13 @@ def _require_implement_fields(implement: Implement, *, label: str = "Implement")
         ("asae_param_b", implement.asae_param_b),
         ("asae_param_c", implement.asae_param_c),
     ]
+    # ASABE D497 tabulates some classes per tool, so for those Eq. 3.1's `W` is
+    # the tool count. The column is nullable because it is meaningless for
+    # full-width tools, which is why the requirement is conditional here rather
+    # than in the schema. Gating before dispatch keeps the message shape
+    # consistent with the other missing-field errors.
+    if draft_width_is_tool_count(implement.implement_type):
+        required.append(("number_of_tools", implement.number_of_tools))
     missing = [k for k, v in required if v is None]
     if missing:
         raise HTTPException(
@@ -489,6 +508,16 @@ def run_simulation(
     if implement_2 is not None and not is_rotor_implement:
         _require_implement_fields(implement_2, label="Implement 2")
 
+    # `field_length` was required by the request schema but never reached the
+    # engine, so an area inconsistent with length x width was silently accepted
+    # and used. Derive the area from the plot dimensions when both are known --
+    # as the reference implementation does -- and fall back to the supplied area
+    # only when the length is absent.
+    if field_length is not None and field_width is not None:
+        derived_area = (Decimal(str(field_length)) * Decimal(str(field_width))) / Decimal("10000")
+        if derived_area > 0:
+            field_area = derived_area
+
     required_cond = [
         ("soil_texture", soil_texture),
         ("cone_index", cone_index),
@@ -603,6 +632,8 @@ def run_simulation(
                         asae_param_a=float(implement.asae_param_a),
                         asae_param_b=float(implement.asae_param_b),
                         asae_param_c=float(implement.asae_param_c),
+                        vertical_horizontal_ratio=_opt_float(implement.vertical_horizontal_ratio),
+                        number_of_tools=implement.number_of_tools,
                     ),
                     tool_2=PassiveToolInputs(
                         implement_type=implement_2.implement_type,
@@ -612,6 +643,8 @@ def run_simulation(
                         asae_param_a=float(implement_2.asae_param_a),
                         asae_param_b=float(implement_2.asae_param_b),
                         asae_param_c=float(implement_2.asae_param_c),
+                        vertical_horizontal_ratio=_opt_float(implement_2.vertical_horizontal_ratio),
+                        number_of_tools=implement_2.number_of_tools,
                     ),
                     interaction_coefficient=float(payload.interaction_coefficient),
                 )
@@ -628,6 +661,8 @@ def run_simulation(
                         asae_param_a=float(implement.asae_param_a),
                         asae_param_b=float(implement.asae_param_b),
                         asae_param_c=float(implement.asae_param_c),
+                        vertical_horizontal_ratio=_opt_float(implement.vertical_horizontal_ratio),
+                        number_of_tools=implement.number_of_tools,
                     ),
                     rotor=ActiveRotorInputs(
                         weight_kg=float(rotor_specs["rotor_weight"]),
@@ -647,7 +682,8 @@ def run_simulation(
                 width_m=float(implement.width),
                 weight_kg=float(implement.weight),
                 cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
-                vertical_horizontal_ratio=float(implement.vertical_horizontal_ratio or 0.0),
+                vertical_horizontal_ratio=_opt_float(implement.vertical_horizontal_ratio),
+                number_of_tools=implement.number_of_tools,
                 asae_param_a=float(implement.asae_param_a),
                 asae_param_b=float(implement.asae_param_b),
                 asae_param_c=float(implement.asae_param_c),

@@ -23,7 +23,8 @@ from typing import Callable, Optional
 from app.core.constants import (
     BALLAST_SOLVER_MAX_ITERATIONS,
     BALLAST_SOLVER_TOLERANCE,
-    FI_FACTOR_BY_IMPLEMENT_AND_TEXTURE,
+    DRAFT_WIDTH_IS_TOOL_COUNT,
+    FI_FACTOR_BY_TEXTURE,
     FRONT_BALLAST_TARGET_KWEF,
     GRAVITY,
     MAX_SLIP_ITERATIONS,
@@ -43,6 +44,7 @@ from app.core.dss_shared import (
     field_capacity,
     geometry_terms,
     power_and_fuel,
+    require_finite,
     require_positive,
     result_envelope,
     safe_div,
@@ -55,6 +57,7 @@ from app.core.dss_shared import (  # noqa: F401
     put_load_status,
     specific_fuel_consumption_l_per_kwh,
 )
+from app.core.implement_taxonomy import is_passive
 from app.core.engineering_validation import clamp
 from app.models.enums import ImplementType, SoilTexture
 
@@ -97,7 +100,9 @@ class LegacyInputs:
     width_m: float
     weight_kg: float
     cg_distance_from_hitch_m: float
-    vertical_horizontal_ratio: float
+    #: Py/D for this implement. None falls back to the per-type table in
+    #: `constants.PY_OVER_D_RATIO_BY_IMPLEMENT`, since the DB column is nullable.
+    vertical_horizontal_ratio: Optional[float]
     asae_param_a: float
     asae_param_b: float
     asae_param_c: float
@@ -112,6 +117,10 @@ class LegacyInputs:
 
     # Optional: enables the DSS Eq. 3.4 engine-torque pull limit (Pet) diagnostic.
     max_engine_torque_nm: Optional[float] = None
+
+    #: Number of ground-engaging tools. Eq. 3.1's `W` for per-tool implement
+    #: classes (see `constants.DRAFT_WIDTH_IS_TOOL_COUNT`); ignored for the rest.
+    number_of_tools: Optional[int] = None
 
 
 def _passive_only_lookup_error(implement_type: ImplementType, table_name: str) -> ValueError:
@@ -131,32 +140,103 @@ def _passive_only_lookup_error(implement_type: ImplementType, table_name: str) -
 def fi_factor(implement_type: ImplementType, soil_texture: SoilTexture) -> float:
     """Dimensionless soil-texture adjustment parameter F (DSS Eq. 3.1).
 
-    [LEGACY] The document names the texture classes but gives no numeric table;
-    see constants.FI_FACTOR_BY_IMPLEMENT_AND_TEXTURE.
+    [REFERENCE-ALIGNED] One value per soil texture, applied to every implement --
+    see constants.FI_FACTOR_BY_TEXTURE for the provenance and for the known
+    departure from D497's per-implement F rows.
+
+    `implement_type` no longer selects the value; it is validated only. The DSS
+    passive-draft model is defined solely for unpowered tools, and that guard
+    used to fall out of the per-implement table having no rows for active types.
+    A global table has no such row to be missing, so the check is explicit here
+    -- without it, routing a rotor through Eq. 3.1 would silently succeed and
+    model a PTO-powered implement as if it were unpowered.
     """
-    try:
-        by_texture = FI_FACTOR_BY_IMPLEMENT_AND_TEXTURE[implement_type.value]
-    except KeyError:
+    if not is_passive(implement_type):
         raise _passive_only_lookup_error(implement_type, "Fi soil-texture factor")
     try:
-        return by_texture[soil_texture.value]
+        return FI_FACTOR_BY_TEXTURE[soil_texture.value]
     except KeyError:
         raise ValueError(
-            f"No Fi factor for soil texture '{getattr(soil_texture, 'value', soil_texture)}' "
-            f"with implement type '{implement_type.value}'."
+            f"No Fi factor for soil texture '{getattr(soil_texture, 'value', soil_texture)}'."
         )
 
 
-def py_over_d_ratio(implement_type: ImplementType) -> float:
-    """Vertical:horizontal soil-reaction ratio Py/D (DSS Section 3.3, Kepner et al. 1978)."""
+def py_over_d_ratio(
+    implement_type: ImplementType, ratio: Optional[float] = None
+) -> float:
+    """Vertical:horizontal soil-reaction ratio Py/D, used as `Py = (Py/D) * D`.
+
+    Both reference implementations carry this as a **per-implement input** -- the
+    spreadsheet's "Vertical to Horizontal Ratio" cell and the HTML library's
+    `PyD` field -- not as a per-type constant. `ratio` is that per-implement
+    value (`Implement.vertical_horizontal_ratio`); when it is None, because the
+    column is nullable, the per-type table in `constants` is used instead.
+
+    A negative ratio is rejected rather than silently used: it would reverse the
+    direction of the vertical soil reaction.
+    """
+    if ratio is not None:
+        require_finite("Py/D ratio", ratio)
+        if ratio < 0:
+            raise ValueError(
+                "Invalid Py/D ratio: must not be negative, got {0!r}".format(ratio)
+            )
+        return float(ratio)
     try:
         return PY_OVER_D_RATIO_BY_IMPLEMENT[implement_type.value]
     except KeyError:
         raise _passive_only_lookup_error(implement_type, "Py/D ratio")
 
 
+def draft_width_parameter(
+    implement_type: ImplementType,
+    width_m: float,
+    number_of_tools: Optional[int] = None,
+) -> float:
+    """Eq. 3.1's `W`: working width in m, or the tool count for per-tool rows.
+
+    See `constants.DRAFT_WIDTH_IS_TOOL_COUNT` for why the unit differs by
+    implement class. Only Eq. 3.1 uses this -- field capacity, turning time and
+    swath always take the width in metres.
+
+    A missing `number_of_tools` on a per-tool implement RAISES; it does not fall
+    back to the width in metres. An earlier revision did fall back, so that rows
+    predating the column would keep running -- but the result is not merely
+    understated, it is meaningless. For a 9-tine cultivator behind a rotavator at
+    12 cm / 4 km/h the substitution takes draft from 2759 N to 12.6 N (219x low),
+    because in active-passive the understated passive draft is very nearly
+    cancelled by the rotor's forward thrust (`Deff = Dp + Da - Ta`). The run then
+    *succeeds* and reports a plausible "Underloaded" verdict built on ~zero draft.
+
+    A refused answer beats a wrong one that looks right. The API maps ValueError
+    to a 422, so callers get an actionable message naming the field.
+    """
+    if implement_type.value not in DRAFT_WIDTH_IS_TOOL_COUNT:
+        return width_m
+    if number_of_tools is None:
+        raise ValueError(
+            "Implement type '{0}' is tabulated per tool in ASABE D497, so Eq. 3.1's W "
+            "is the number of tools, not the width in metres. This implement has no "
+            "`number_of_tools` recorded, and substituting the width would understate "
+            "draft by roughly 4x (far more in an active-passive combination). Set the "
+            "tool count on the implement.".format(implement_type.value)
+        )
+    if number_of_tools <= 0:
+        raise ValueError(
+            "Invalid number of tools: must be a positive whole number, got {0!r}".format(
+                number_of_tools
+            )
+        )
+    return float(number_of_tools)
+
+
+def draft_width_is_tool_count(implement_type: ImplementType) -> bool:
+    """True when Eq. 3.1's `W` is a tool count rather than a width in metres."""
+    return implement_type.value in DRAFT_WIDTH_IS_TOOL_COUNT
+
+
 def estimate_draft_force(inputs: LegacyInputs) -> float:
-    """Implement draft force D, N (DSS Eq. 3.1): D = F*(A + B*S + C*S^2)*W*(T/10).
+    """Implement draft force D, N (DSS Eq. 3.1): D = F*(A + B*S + C*S^2)*W*T.
 
     Thin binding of `LegacyInputs` onto the single Eq. 3.1 kernel in
     `dss_shared.draft_force_n`, which all three modes share.
@@ -167,7 +247,9 @@ def estimate_draft_force(inputs: LegacyInputs) -> float:
         asae_param_b=inputs.asae_param_b,
         asae_param_c=inputs.asae_param_c,
         speed_kmh=inputs.speed_kmh,
-        width_m=inputs.width_m,
+        width_m=draft_width_parameter(
+            inputs.implement_type, inputs.width_m, inputs.number_of_tools
+        ),
         depth_cm=inputs.depth_cm,
     )
 
@@ -273,9 +355,38 @@ def rolling_resistance_front(bn_front: float) -> float:
 
 
 def gross_traction_ratio(bn_rear: float) -> float:
-    """mu_g = 0.88 * (1 - exp(-0.1*Bn)) [DSS-EXACT]."""
+    """mu_g = 0.88 * (1 - exp(-0.1*Bn)) [DSS-EXACT].
+
+    This is the Brixius *envelope* factor -- the asymptotic ceiling the gross
+    traction ratio approaches as slip grows -- NOT the gross traction ratio at a
+    given slip. It is the correct quantity inside `net_traction_coefficient`,
+    which multiplies it by the slip term. For the ratio actually developed at an
+    operating slip (the denominator of tractive efficiency), use
+    `gross_traction_at_slip`.
+    """
     require_positive("rear wheel numeric", bn_rear)
     return TRACTION_MU_G_SCALE * (1.0 - math.exp(-TRACTION_BN_EXPONENT_COEFF * bn_rear))
+
+
+def gross_traction_at_slip(
+    bn_rear: float, slip_fraction: float, mu_g: Optional[float] = None
+) -> float:
+    """Gross traction ratio actually developed at slip S -- Brixius (1987):
+
+        GT = 0.88*(1 - exp(-0.1*Bn))*(1 - exp(-7.5*S)) + 0.04
+
+    Brixius' companion motion-resistance ratio is
+    `MR = 0.04 + 1/Bn + 0.5*S/sqrt(Bn)`, and `net_traction_coefficient` returns
+    exactly `GT - MR` (the two 0.04 terms cancel), which identifies the model
+    beyond doubt and fixes what `GT` must be here.
+    """
+    require_positive("rear wheel numeric", bn_rear)
+    if mu_g is None:
+        mu_g = gross_traction_ratio(bn_rear)
+    return (
+        mu_g * (1.0 - math.exp(-TRACTION_SLIP_EXPONENT_COEFF * slip_fraction))
+        + ROLLING_RESISTANCE_BASE
+    )
 
 
 def net_traction_coefficient(
@@ -300,11 +411,30 @@ def net_traction_coefficient(
     )
 
 
-def traction_efficiency_percent(mu: float, mu_g: float, slip_fraction: float) -> float:
-    """TE = mu*(1-S) / mu_g (DSS Eq. 3.2), as a percentage."""
+def traction_efficiency_percent(
+    mu: float, mu_g: float, slip_fraction: float, *, bn_rear: float
+) -> float:
+    """TE = mu*(1-S) / GT (DSS Eq. 3.2), as a percentage.
+
+    Eq. 3.2's denominator is the gross traction ratio *developed at the operating
+    slip* (`gross_traction_at_slip`), not the Brixius envelope `mu_g`.
+    Substituting the envelope understates TE by roughly 3x at working slips (26%
+    where the correct value is 75%), makes TE monotonic in slip so no optimum
+    exists, and -- because `Ptr = DBp/(TE*eta_t)` -- inflates power utilisation
+    by the same factor, which is the DSS's headline Overloaded/Underloaded
+    verdict.
+
+    `bn_rear` is keyword-only and REQUIRED on purpose: the original bug was that
+    the denominator could be supplied as the envelope without anything
+    complaining. Callers must now be explicit about which Bn the slip-dependent
+    denominator is built from.
+    """
     if mu_g == 0:
         raise ValueError("Gross traction ratio is zero")
-    return (mu * (1.0 - slip_fraction) / mu_g) * 100.0
+    denominator = gross_traction_at_slip(bn_rear, slip_fraction, mu_g=mu_g)
+    if denominator <= 0:
+        raise ValueError("Gross traction ratio at the operating slip is non-positive")
+    return (mu * (1.0 - slip_fraction) / denominator) * 100.0
 
 
 @dataclass(frozen=True)
@@ -389,6 +519,9 @@ def engine_torque_limited_pull_n(
 
 @dataclass(frozen=True)
 class SlipSolution:
+    #: Slip actually reported and used downstream. Linearly interpolated between
+    #: the last two trial steps, so it is the slip at which Pst == D rather than
+    #: the 0.1%-quantised step that first exceeded it.
     slip_pct: float
     bn_rear: float
     mu: float
@@ -400,6 +533,9 @@ class SlipSolution:
     #: Distinguishes "this soil/load cannot pull at all" from "the pull is simply
     #: short of the draft at the 20% cap", which need different advice.
     traction_possible: bool = True
+    #: The raw trial step the search stopped on, before interpolation. Reported
+    #: as a diagnostic so the DSS Section 3.4.6 schedule stays auditable.
+    stepped_slip_pct: float = 0.0
 
 
 def solve_slip(
@@ -417,6 +553,16 @@ def solve_slip(
     per-wheel load (W = Rr/2). Defaults to the Section 3 `Bn`, which every mode
     now uses; the seam is kept so an alternative model can be supplied without
     touching the solver.
+
+    On convergence the reported slip is **linearly interpolated** between the
+    last two trial steps, matching the reference implementation:
+
+        s = s_prev + (D - Pst_prev) * (s_step - s_prev) / (Pst_step - Pst_prev)
+
+    The stepped value is the first 0.1% increment at which pull exceeds draft, so
+    it systematically overstates slip by up to one step; interpolating recovers
+    the slip at which Pst == D. `mu` and `pull_n` are re-evaluated there so the
+    whole solution stays self-consistent.
     """
     resolved_mobility_fn = mobility_fn or mobility_number
     bn_rear = resolved_mobility_fn(ci_kpa, rear_section_width_m, rear_overall_diameter_m, rear_axle_load_n / 2.0)
@@ -429,6 +575,7 @@ def solve_slip(
     pull_n = 0.0
     converged = False
     best_mu = float("-inf")
+    prev: Optional[tuple] = None  # (slip_pct, pull_n) of the last step short of draft
 
     for _ in range(MAX_SLIP_ITERATIONS):
         mu = net_traction_coefficient(bn_rear, slip_pct / 100.0, mu_g=mu_g)
@@ -437,6 +584,7 @@ def solve_slip(
         if pull_n >= draft_n:
             converged = True
             break
+        prev = (slip_pct, pull_n)
         slip_pct += SLIP_INCREMENT_PCT
         if slip_pct >= MAX_SLIP_PCT:
             slip_pct = MAX_SLIP_PCT
@@ -444,6 +592,16 @@ def solve_slip(
             best_mu = max(best_mu, mu)
             pull_n = mu * rear_axle_load_n
             break
+
+    stepped_slip_pct = slip_pct
+    if converged and prev is not None:
+        prev_slip, prev_pull = prev
+        span = pull_n - prev_pull
+        if span > 0:
+            slip_pct = prev_slip + (draft_n - prev_pull) * (stepped_slip_pct - prev_slip) / span
+            # Re-evaluate at the interpolated slip so mu/pull match the reported slip.
+            mu = net_traction_coefficient(bn_rear, slip_pct / 100.0, mu_g=mu_g)
+            pull_n = mu * rear_axle_load_n
 
     return SlipSolution(
         slip_pct=slip_pct,
@@ -453,119 +611,125 @@ def solve_slip(
         pull_n=pull_n,
         converged=converged,
         traction_possible=best_mu > 0.0,
+        stepped_slip_pct=stepped_slip_pct,
     )
 
 
 def front_ballast_required_kg(
     *,
-    kwef: float,
     tractor_weight_n: float,
-    rsf_n: float,
-    draft_n: float,
-    yd_m: float,
-    implement_weight_n: float,
-    py_n: float,
-    cg_distance_from_hitch_m: float,
-    hitch_distance_from_rear_m: float,
-    er_m: float,
-    ef_m: float,
-    wheelbase_m: float,
-) -> tuple[float, bool]:
-    """Front ballast BRf so that Kwef = Rf/Wt = 0.20 (DSS Eq. 3.7), solved by bisection.
+    rf_for_added_weight_n: Callable[[float], float],
+) -> tuple[Optional[float], bool]:
+    """Front ballast BRf, in kg, so that Kwef = Rf/(Wt + BRf) >= 0.20.
 
-    0.2*(Wt+BRf) = [Wt*((Rsf+BRf)/(Wt+BRf) - er) + D*Yd - (Wm+Py)*(Xcgi+Hd+er)] / (L-er+ef)
+    `rf_for_added_weight_n(extra_n)` must return the dynamic front axle load with
+    `extra_n` Newtons of ballast added to the tractor -- i.e. the caller's own
+    Eq. 3.5/3.6 balance re-solved. Passing it as a callable keeps this solver
+    usable by all three modes without this module importing the combination
+    balance (which imports from here).
 
-    Returns (ballast_kg, feasible). For some geometries this equation has no
-    finite solution (the RHS saturates below the ever-growing LHS target) --
-    that is a real property of the DSS formula, not a solver bug. When
-    infeasible, ballast_kg is the search-ceiling estimate and feasible=False,
-    so callers can surface a warning instead of a falsely-precise number.
+    Solved by bisection on the ballast mass, per the reference implementation:
+    the residual re-evaluates the *actual* axle balance rather than an implicit
+    closed form, so it cannot disagree with the axle loads reported elsewhere.
+
+    Returns `(ballast_kg, reachable)`. When the target cannot be met by any
+    ballast within the search ceiling, returns `(None, False)` so the caller can
+    warn rather than quote a falsely precise number.
+
+    Supersedes a transcription of DSS Eq. 3.7, an implicit form whose right-hand
+    side saturates below the ever-growing target for some geometries, making the
+    target unreachable as an artefact of the equation rather than the physics.
     """
-    if kwef >= FRONT_BALLAST_TARGET_KWEF:
+    require_positive("tractor weight", tractor_weight_n)
+
+    def kwef_gap(ballast_kg: float) -> float:
+        added_n = ballast_kg * GRAVITY
+        return rf_for_added_weight_n(added_n) / (tractor_weight_n + added_n) - FRONT_BALLAST_TARGET_KWEF
+
+    if kwef_gap(0.0) >= 0:
         return 0.0, True
 
-    denom = wheelbase_m - er_m + ef_m
+    lo, hi = 0.0, 5000.0
+    for _ in range(40):
+        if kwef_gap(hi) >= 0:
+            break
+        hi *= 1.6
+    else:
+        return None, False
+    if kwef_gap(hi) < 0:
+        return None, False
 
-    def residual(br_f: float) -> float:
-        lhs = FRONT_BALLAST_TARGET_KWEF * (tractor_weight_n + br_f)
-        rhs = (
-            tractor_weight_n * ((rsf_n + br_f) / (tractor_weight_n + br_f) - er_m)
-            + draft_n * yd_m
-            - (implement_weight_n + py_n) * (cg_distance_from_hitch_m + hitch_distance_from_rear_m + er_m)
-        ) / denom
-        return rhs - lhs
-
-    lo, hi = 0.0, tractor_weight_n * 5.0 + 1.0
-    f_lo, f_hi = residual(lo), residual(hi)
-    if abs(f_lo) < BALLAST_SOLVER_TOLERANCE:
-        return 0.0, True
-    if (f_lo > 0) == (f_hi > 0):
-        # Residual never brackets zero within the search range: the front-axle
-        # deficit persists (or is already satisfied) for every ballast amount
-        # tried. If it's a persistent deficit (negative throughout), no finite
-        # front ballast can reach Kwef=0.20 under this equation.
-        return (0.0 if f_lo > 0 else hi) / GRAVITY, False
     for _ in range(BALLAST_SOLVER_MAX_ITERATIONS):
         mid = (lo + hi) / 2.0
-        f_mid = residual(mid)
-        if abs(f_mid) < BALLAST_SOLVER_TOLERANCE or (hi - lo) < BALLAST_SOLVER_TOLERANCE:
-            return mid / GRAVITY, True
-        if (f_mid > 0) == (f_lo > 0):
-            lo, f_lo = mid, f_mid
+        if hi - lo < BALLAST_SOLVER_TOLERANCE:
+            break
+        if kwef_gap(mid) < 0:
+            lo = mid
         else:
             hi = mid
-    return ((lo + hi) / 2.0) / GRAVITY, True
+    return (lo + hi) / 2.0, True
 
 
 def rear_ballast_required_kg(
     *,
-    slip_pct: float,
     draft_n: float,
     rear_axle_load_n: float,
-    rsr_n: float,
     ci_kpa: float,
     rear_section_width_m: float,
     rear_overall_diameter_m: float,
-    yd_m: float,
-    implement_weight_n: float,
-    py_n: float,
-    cg_distance_from_hitch_m: float,
-    hitch_distance_from_rear_m: float,
-    tractor_weight_n: float,
-    er_m: float,
-    ef_m: float,
-    wheelbase_m: float,
+    target_slip_fraction: Optional[float] = None,
     mobility_fn: MobilityNumberFn = None,
-) -> float:
-    """Rear ballast BRr to limit slip to 15% (DSS Eq. 3.8, 3.9), R' solved by fixed-point iteration.
+) -> tuple[Optional[float], Optional[str]]:
+    """Rear ballast BRr, in kg, to bring slip down to the target (default 15%).
 
-    R' = D / mu'(S=0.15, Bn evaluated at W = R'/2)
-    BRr = [R'(L-er+ef) + D*Yd - Rsr*L - Wt*ef - (Wm+Py)*(Xcgi+Hd+er)] / (L+ef)
+        R'  = D / mu'(s_target, Bn evaluated at W = R'/2)     fixed point
+        BRr = max(0, (R' - Rr) / g)
 
-    The wheel numeric is re-evaluated at the *trial* rear load R' on every
-    iteration (W = R'/2), per the DSS note "Bn' = mobility number at W=R'/2".
-    `mobility_fn` selects the model; all modes now use the Section 3 `Bn` default.
+    `R'` is the rear-axle load that would develop the required pull at the target
+    slip; the ballast is simply the shortfall against the current load. The wheel
+    numeric is re-evaluated at the trial load on every iteration, per the DSS note
+    "Bn' = mobility number at W = R'/2".
 
-    Raises `ValueError` when the fixed point does not settle within
-    `BALLAST_SOLVER_MAX_ITERATIONS`, rather than returning the last trial value as
-    if it had converged.
+    `target_slip_fraction` defaults to the 15% DSS target. Active-passive passes
+    its solved slip instead, matching the reference implementation and DSS
+    Eq. 5.12/5.13 -- which is the same expression, so all three modes now share
+    this one solver.
+
+    No early return for slip already below target: `R'` then comes out below `Rr`
+    and the max() yields 0 naturally.
+
+    Returns `(ballast_kg, problem)`. `problem` is None on success; when the
+    requirement cannot be sized it is an explanatory message and `ballast_kg` is
+    None -- mirroring `front_ballast_required_kg`.
+
+    Infeasibility is reported rather than raised deliberately. Both failure modes
+    below mean "this pairing is too heavy for this soil", which is precisely the
+    verdict the DSS exists to deliver; raising would discard the whole result set
+    (draft, slip, power, fuel) and leave the caller with a bare error instead of
+    the evidence for that verdict. The value is still never fabricated -- callers
+    get None plus the reason, and surface it as a warning.
+
+    Supersedes a transcription of DSS Eq. 3.8, a moment-balance form that
+    disagreed with both reference implementations.
     """
-    if slip_pct <= REAR_BALLAST_TARGET_SLIP_PCT:
-        return 0.0
-
     resolved_mobility_fn = mobility_fn or mobility_number
-    target_slip_fraction = REAR_BALLAST_TARGET_SLIP_PCT / 100.0
-    r_prime = float(rear_axle_load_n)
+    if target_slip_fraction is None:
+        target_slip_fraction = REAR_BALLAST_TARGET_SLIP_PCT / 100.0
+    # Seed at the larger of the current axle load and the draft, per the
+    # reference: starting below the draft can send the first iterate far away.
+    r_prime = max(float(rear_axle_load_n), float(draft_n))
     settled = False
     for _ in range(BALLAST_SOLVER_MAX_ITERATIONS):
         bn_prime = resolved_mobility_fn(ci_kpa, rear_section_width_m, rear_overall_diameter_m, r_prime / 2.0)
         mu_prime = net_traction_coefficient(bn_prime, target_slip_fraction)
         if mu_prime <= 0:
-            raise ValueError(
-                "Cannot size rear ballast: at the 15% target slip the wheel numeric "
-                "Bn = {0:.3f} (W = R'/2 = {1:.0f} N) yields a non-positive coefficient of "
-                "traction, so no rear-axle load develops the required pull. Work firmer "
-                "soil or reduce draft.".format(bn_prime, r_prime / 2.0)
+            return None, (
+                "Rear ballast could not be sized: at the {0:.1f}% target slip the wheel "
+                "numeric Bn = {1:.3f} (W = R'/2 = {2:.0f} N) yields a non-positive "
+                "coefficient of traction, so no rear-axle load develops the required pull. "
+                "Work firmer soil, or reduce depth/speed/width to lower the draft.".format(
+                    target_slip_fraction * 100.0, bn_prime, r_prime / 2.0
+                )
             )
         r_prime_new = draft_n / mu_prime
         if abs(r_prime_new - r_prime) < BALLAST_SOLVER_TOLERANCE:
@@ -575,21 +739,13 @@ def rear_ballast_required_kg(
         r_prime = r_prime_new
 
     if not settled:
-        raise ValueError(
-            "Rear-ballast fixed point did not converge in {0} iterations "
-            "(last R' = {1:.1f} N). The ballast requirement is unreliable for these "
+        return None, (
+            "Rear ballast could not be sized: the fixed point did not converge in {0} "
+            "iterations (last R' = {1:.1f} N). The requirement is unreliable for these "
             "inputs and has not been reported.".format(BALLAST_SOLVER_MAX_ITERATIONS, r_prime)
         )
 
-    br_r = (
-        r_prime * (wheelbase_m - er_m + ef_m)
-        + draft_n * yd_m
-        - rsr_n * wheelbase_m
-        - tractor_weight_n * ef_m
-        - (implement_weight_n + py_n) * (cg_distance_from_hitch_m + hitch_distance_from_rear_m + er_m)
-    ) / (wheelbase_m + ef_m)
-
-    return max(0.0, br_r / GRAVITY)
+    return max(0.0, (r_prime - rear_axle_load_n) / GRAVITY), None
 
 
 def _engine_torque_warnings(pet_n: float, draft_n: float) -> list:
@@ -618,6 +774,69 @@ def _engine_torque_warnings(pet_n: float, draft_n: float) -> list:
     return []
 
 
+@dataclass(frozen=True)
+class AxleLoadResolution:
+    """Axle loads, after fitting stabilising front ballast if the front end lifts."""
+
+    rear_axle_load_n: float
+    front_axle_load_n: float
+    #: Front ballast fitted to make the combination driveable; 0.0 if none was needed.
+    stabilising_ballast_kg: float
+    infeasible_without_ballast: bool
+
+
+def resolve_axle_loads(
+    *,
+    rear_axle_load_n: float,
+    front_axle_load_n: float,
+    tractor_weight_n: float,
+    axle_loads_for_added_weight: Callable[[float], "tuple[float, float]"],
+    warnings: list,
+) -> AxleLoadResolution:
+    """Keep a front-lifting combination answerable instead of failing the run.
+
+    A non-positive front axle load means the draft has lifted the front end. That
+    is a real physical limit, but it is exactly the condition the DSS exists to
+    advise on: front ballast usually restores it, and the engine already has a
+    solver for how much. Raising here instead -- which is what the code used to
+    do -- refused the question rather than answering it, and did so for about 15%
+    of catalogue pairings.
+
+    A non-positive *rear* load is not rescuable this way (adding front ballast
+    moves load off the driven axle), so it still raises.
+    """
+    if rear_axle_load_n <= 0:
+        raise ValueError(
+            "Invalid load distribution: the rear (driven) axle load became non-positive "
+            "({0:.0f} N). The implement's weight and vertical soil reaction are carried "
+            "so far behind the tractor that it cannot stay on its driven wheels; front "
+            "ballast cannot fix this. Reduce working depth, or use a lighter implement "
+            "or one whose centre of gravity sits closer to the hitch.".format(rear_axle_load_n)
+        )
+    if front_axle_load_n > 0:
+        return AxleLoadResolution(rear_axle_load_n, front_axle_load_n, 0.0, False)
+
+    ballast_kg, reachable = front_ballast_required_kg(
+        tractor_weight_n=tractor_weight_n,
+        rf_for_added_weight_n=lambda extra_n: axle_loads_for_added_weight(extra_n)[1],
+    )
+    if not reachable or ballast_kg is None:
+        raise ValueError(
+            "Invalid load distribution: the draft lifts the front axle ({0:.0f} N) and no "
+            "amount of front ballast restores it. This tractor is too light for this "
+            "implement at these settings -- reduce depth or speed, or pair a narrower "
+            "implement with it.".format(front_axle_load_n)
+        )
+
+    rd_n, fd_n = axle_loads_for_added_weight(ballast_kg * GRAVITY)
+    warnings.append(
+        "Front axle lifts under this draft: the results below assume {0:.0f} kg of front "
+        "ballast, the minimum that restores the Kwef=0.20 steering-weight target. Without "
+        "it this combination is not driveable.".format(ballast_kg)
+    )
+    return AxleLoadResolution(rd_n, fd_n, ballast_kg, True)
+
+
 def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     require_positive("implement width", inputs.width_m)
     require_positive("operating speed", inputs.speed_kmh)
@@ -633,7 +852,9 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
 
     tractor_weight_n = (inputs.front_axle_weight_kg + inputs.rear_axle_weight_kg) * GRAVITY
     implement_weight_n = inputs.weight_kg * GRAVITY
-    py_over_d = py_over_d_ratio(inputs.implement_type)
+    # Py/D comes from the implement record when present (both references treat it
+    # as a per-implement input); the per-type table is only a fallback.
+    py_over_d = py_over_d_ratio(inputs.implement_type, inputs.vertical_horizontal_ratio)
     py_n = py_over_d * draft_n
     geometry = geometry_terms(
         depth_cm=inputs.depth_cm,
@@ -642,23 +863,33 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     )
     yd_m, er_m, ef_m = geometry.yd_m, geometry.er_m, geometry.ef_m
 
-    rd_n, fd_n = dynamic_axle_loads(
-        draft_n=draft_n,
-        depth_cm=inputs.depth_cm,
-        wheelbase_m=inputs.wheelbase_m,
-        hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
-        cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
-        cg_distance_from_hitch_m=inputs.cg_distance_from_hitch_m,
-        rear_rolling_radius_m=inputs.rear_rolling_radius_m,
-        front_rolling_radius_m=inputs.front_rolling_radius_m,
-        tractor_weight_n=tractor_weight_n,
-        implement_weight_n=implement_weight_n,
-        py_n=py_n,
-    )
-    if rd_n <= 0 or fd_n <= 0:
-        raise ValueError("Invalid load distribution: dynamic axle load became non-positive")
+    def _axle_loads_with_ballast(extra_n: float) -> "tuple[float, float]":
+        """Both axle loads with `extra_n` N of front ballast, same Eq. 3.5 balance."""
+        return dynamic_axle_loads(
+            draft_n=draft_n,
+            depth_cm=inputs.depth_cm,
+            wheelbase_m=inputs.wheelbase_m,
+            hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
+            cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
+            cg_distance_from_hitch_m=inputs.cg_distance_from_hitch_m,
+            rear_rolling_radius_m=inputs.rear_rolling_radius_m,
+            front_rolling_radius_m=inputs.front_rolling_radius_m,
+            tractor_weight_n=tractor_weight_n + extra_n,
+            implement_weight_n=implement_weight_n,
+            py_n=py_n,
+        )
+
+    rd_n, fd_n = _axle_loads_with_ballast(0.0)
 
     warnings: list[str] = []
+    axles = resolve_axle_loads(
+        rear_axle_load_n=rd_n,
+        front_axle_load_n=fd_n,
+        tractor_weight_n=tractor_weight_n,
+        axle_loads_for_added_weight=_axle_loads_with_ballast,
+        warnings=warnings,
+    )
+    rd_n, fd_n = axles.rear_axle_load_n, axles.front_axle_load_n
     slip_solution = solve_slip(
         draft_n=draft_n,
         rear_axle_load_n=rd_n,
@@ -691,7 +922,9 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     )
     bnf, rho_r, rho_f, mr_ratio = wheels.bn_front, wheels.rho_r, wheels.rho_f, wheels.mr_ratio
 
-    te_pct = clamp(traction_efficiency_percent(mu, mu_g, slip / 100.0), 0.0, 100.0)
+    te_pct = clamp(
+        traction_efficiency_percent(mu, mu_g, slip / 100.0, bn_rear=bnr), 0.0, 100.0
+    )
     if te_pct <= 0:
         raise ValueError("Either decrease depth or speed of operation, since slip is very low")
 
@@ -737,18 +970,8 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         warnings.extend(_engine_torque_warnings(pet_n, draft_n))
 
     ballast_front_kg, front_ballast_feasible = front_ballast_required_kg(
-        kwef=kwf,
         tractor_weight_n=tractor_weight_n,
-        rsf_n=inputs.front_axle_weight_kg * GRAVITY,
-        draft_n=draft_n,
-        yd_m=yd_m,
-        implement_weight_n=implement_weight_n,
-        py_n=py_n,
-        cg_distance_from_hitch_m=inputs.cg_distance_from_hitch_m,
-        hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
-        er_m=er_m,
-        ef_m=ef_m,
-        wheelbase_m=inputs.wheelbase_m,
+        rf_for_added_weight_n=lambda extra_n: _axle_loads_with_ballast(extra_n)[1],
     )
     if not front_ballast_feasible:
         warnings.append(
@@ -757,24 +980,15 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
             "different implement or tractor pairing."
         )
 
-    ballast_rear_kg = rear_ballast_required_kg(
-        slip_pct=slip,
+    ballast_rear_kg, rear_ballast_problem = rear_ballast_required_kg(
         draft_n=draft_n,
         rear_axle_load_n=rd_n,
-        rsr_n=inputs.rear_axle_weight_kg * GRAVITY,
         ci_kpa=inputs.cone_index_kpa,
         rear_section_width_m=inputs.rear_section_width_m,
         rear_overall_diameter_m=inputs.rear_overall_diameter_m,
-        yd_m=yd_m,
-        implement_weight_n=implement_weight_n,
-        py_n=py_n,
-        cg_distance_from_hitch_m=inputs.cg_distance_from_hitch_m,
-        hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
-        tractor_weight_n=tractor_weight_n,
-        er_m=er_m,
-        ef_m=ef_m,
-        wheelbase_m=inputs.wheelbase_m,
     )
+    if rear_ballast_problem:
+        warnings.append(rear_ballast_problem)
 
     sfc = power.sfc
     fuel_cons_l_per_ha = power.fuel_l_per_ha
@@ -850,5 +1064,21 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         "legacy_mobility_number_rear": bnr,
         "legacy_mobility_number_front": bnf,
         "legacy_gross_traction_ratio": mu_g,
+        # Gross traction ratio developed AT the operating slip -- the denominator
+        # Eq. 3.2 actually calls for. Reported so the TE figure is checkable.
+        "gross_traction_at_slip": gross_traction_at_slip(bnr, slip / 100.0, mu_g=mu_g),
+        # TE computed the way both reference implementations do it, dividing by the
+        # Brixius envelope instead. Diagnostic ONLY -- it is the known-incorrect
+        # form (see SIMULATION_ENGINE_FORMULAS.md A9) and drives nothing. Present
+        # so a number-for-number comparison against those references is explainable
+        # without re-deriving it by hand.
+        "traction_efficiency_reference_basis": (
+            mu * (1.0 - slip / 100.0) / mu_g * 100.0 if mu_g else 0.0
+        ),
+        "slip_stepped": slip_solution.stepped_slip_pct,
+        # Front ballast fitted to keep a front-lifting combination answerable.
+        # Non-zero means the figures above are conditional on carrying it.
+        "stabilising_front_ballast_kg": axles.stabilising_ballast_kg,
+        "infeasible_without_ballast": axles.infeasible_without_ballast,
         "calculation_mode": "dss_spec_v1",
     }

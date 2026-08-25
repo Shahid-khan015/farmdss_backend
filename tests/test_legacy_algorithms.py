@@ -12,17 +12,22 @@ import math
 
 import pytest
 
+from app.core.constants import GRAVITY
 from app.core.legacy_algorithms import (
     LegacyInputs,
     calculate_legacy_performance,
     dynamic_axle_loads,
     estimate_draft_force,
+    draft_width_parameter,
+    fi_factor,
     front_ballast_required_kg,
+    gross_traction_at_slip,
     gross_traction_ratio,
     mobility_number,
     net_traction_coefficient,
     put_load_status,
     rear_ballast_required_kg,
+    resolve_axle_loads,
     rolling_resistance_front,
     rolling_resistance_rear,
     solve_slip,
@@ -52,7 +57,9 @@ def make_inputs(**overrides) -> LegacyInputs:
         width_m=1.5,
         weight_kg=320.0,
         cg_distance_from_hitch_m=0.8,
-        vertical_horizontal_ratio=0.65,  # no longer used by the engine; DSS Py/D table supersedes it
+        # None exercises the fallback to the per-type Py/D table (MB Plough -> 0.20).
+        # The engine reads this field first when it is set, as both references do.
+        vertical_horizontal_ratio=None,
         asae_param_a=100.0,
         asae_param_b=50.0,
         asae_param_c=10.0,
@@ -67,34 +74,57 @@ def make_inputs(**overrides) -> LegacyInputs:
     return LegacyInputs(**base)
 
 
-# --- Draft equation (DSS Eq. 3.1: D = F*(A+B*S+C*S^2)*W*(T/10)) ---------------------
+# --- Draft equation (DSS Eq. 3.1: D = F*(A+B*S+C*S^2)*W*T) --------------------------
 
 
 def test_draft_force_matches_dss_equation():
     inputs = make_inputs()
-    # Fi(MB Plough, Fine) = 1.0
-    expected = 1.0 * (100.0 + 50.0 * 5.0 + 10.0 * 5.0**2) * 1.5 * (15.0 / 10.0)
-    assert expected == pytest.approx(1350.0)
+    # Fi(MB Plough, Fine) = 1.0. W in m, T in cm, no divisor on T.
+    expected = 1.0 * (100.0 + 50.0 * 5.0 + 10.0 * 5.0**2) * 1.5 * 15.0
+    assert expected == pytest.approx(13500.0)
     assert estimate_draft_force(inputs) == pytest.approx(expected)
 
 
-def test_draft_force_depth_uses_divide_by_10():
-    # DSS Eq 3.1 explicitly divides tillage depth by 10 (confirmed unambiguous in the
-    # source OMML XML, not an image-legibility question).
+def test_draft_force_is_linear_in_depth():
     inputs_10cm = make_inputs(depth_cm=10.0)
     inputs_20cm = make_inputs(depth_cm=20.0)
-    # Draft is linear in T/10, so doubling depth must exactly double draft.
+    # Draft is linear in T, so doubling depth must exactly double draft.
     assert estimate_draft_force(inputs_20cm) == pytest.approx(2.0 * estimate_draft_force(inputs_10cm))
 
 
 @pytest.mark.parametrize(
+    "implement_type",
+    [
+        ImplementType.MB_PLOUGH,
+        ImplementType.DISC_PLOUGH,
+        ImplementType.DISC_HARROW,
+        ImplementType.CULTIVATOR,
+    ],
+)
+@pytest.mark.parametrize(
     "texture,expected_fi",
     [(SoilTexture.FINE, 1.0), (SoilTexture.MEDIUM, 0.70), (SoilTexture.COARSE, 0.45)],
 )
-def test_fi_soil_texture_factor_for_mb_plough(texture, expected_fi):
-    inputs = make_inputs(soil_texture=texture)
-    fine_draft = estimate_draft_force(make_inputs(soil_texture=SoilTexture.FINE))
-    draft = estimate_draft_force(inputs)
+def test_fi_soil_texture_factor_is_global(implement_type, texture, expected_fi):
+    """Fi depends on soil texture alone -- all 12 implement x texture combinations.
+
+    Measured through the draft equation rather than by reading the table, so this
+    also pins that `Fi` is the only thing texture changes: everything else in
+    Eq. 3.1 is held fixed, and the ratio to fine soil must therefore be exactly
+    Fi for every implement class.
+    """
+    # A cultivator's Eq. 3.1 `W` is its tool count, which the engine requires.
+    extra = (
+        {"number_of_tools": 9}
+        if implement_type is ImplementType.CULTIVATOR
+        else {}
+    )
+    fine_draft = estimate_draft_force(
+        make_inputs(implement_type=implement_type, soil_texture=SoilTexture.FINE, **extra)
+    )
+    draft = estimate_draft_force(
+        make_inputs(implement_type=implement_type, soil_texture=texture, **extra)
+    )
     assert draft / fine_draft == pytest.approx(expected_fi)
 
 
@@ -175,8 +205,18 @@ def test_traction_efficiency_formula():
     slip = 0.10
     mu = net_traction_coefficient(bn, slip)
     mu_g = gross_traction_ratio(bn)
-    expected = (mu * (1.0 - slip) / mu_g) * 100.0
-    assert traction_efficiency_percent(mu, mu_g, slip) == pytest.approx(expected)
+    # DSS Eq. 3.2: TE = mu*(1-S)/GT, GT taken AT the operating slip.
+    expected = (mu * (1.0 - slip) / gross_traction_at_slip(bn, slip)) * 100.0
+    assert traction_efficiency_percent(mu, mu_g, slip, bn_rear=bn) == pytest.approx(expected)
+
+
+def test_traction_efficiency_requires_an_explicit_bn():
+    """`bn_rear` is mandatory so the envelope can never be passed in by accident."""
+    bn, slip = 40.0, 0.10
+    mu_g = gross_traction_ratio(bn)
+    mu = net_traction_coefficient(bn, slip)
+    with pytest.raises(TypeError):
+        traction_efficiency_percent(mu, mu_g, slip)  # type: ignore[call-arg]
 
 
 # --- Dynamic axle loads (DSS Eq. 3.5, 3.6) --------------------------------------------
@@ -259,7 +299,11 @@ def test_deeper_draft_transfers_load_off_the_rear_axle():
 
 
 def test_slip_iteration_follows_the_dss_schedule():
-    """DSS Section 3.4.6: start at 2%, step 0.1%, stop as soon as Pst = mu*Rr >= D."""
+    """DSS Section 3.4.6: start at 2%, step 0.1%, stop as soon as Pst = mu*Rr >= D.
+
+    The *stepped* slip is what must sit on the schedule's grid; the reported slip
+    is interpolated between the last two grid points (see the test below).
+    """
     solution = solve_slip(
         draft_n=1350.0,
         rear_axle_load_n=9000.0,
@@ -267,18 +311,45 @@ def test_slip_iteration_follows_the_dss_schedule():
         rear_section_width_m=0.34,
         rear_overall_diameter_m=1.30,
     )
-    # The converged slip must be on the 2% + k*0.1% grid.
-    steps = (solution.slip_pct - 2.0) / 0.1
+    steps = (solution.stepped_slip_pct - 2.0) / 0.1
     assert steps == pytest.approx(round(steps), abs=1e-6)
     assert steps >= 0
 
-    # Pst = mu*Rr at the converged slip, and the previous grid point fell short --
-    # i.e. the loop stopped at the *first* sufficient slip, not a later one.
-    assert solution.pull_n == pytest.approx(solution.mu * 9000.0)
-    assert solution.pull_n >= 1350.0
-    if solution.slip_pct > 2.0:
-        previous = net_traction_coefficient(solution.bn_rear, (solution.slip_pct - 0.1) / 100.0) * 9000.0
+    # The loop stopped at the *first* sufficient grid point, not a later one.
+    stepped_pull = net_traction_coefficient(solution.bn_rear, solution.stepped_slip_pct / 100.0) * 9000.0
+    assert stepped_pull >= 1350.0
+    if solution.stepped_slip_pct > 2.0:
+        previous = net_traction_coefficient(
+            solution.bn_rear, (solution.stepped_slip_pct - 0.1) / 100.0
+        ) * 9000.0
         assert previous < 1350.0
+
+
+def test_slip_is_interpolated_between_the_last_two_grid_points():
+    """The reported slip is where Pst == D, not the grid point that overshot it.
+
+    Matches the reference implementation. `mu` and `pull_n` are re-evaluated at
+    the interpolated slip, so the whole solution stays self-consistent.
+    """
+    draft_n, rr_n = 1350.0, 9000.0
+    solution = solve_slip(
+        draft_n=draft_n,
+        rear_axle_load_n=rr_n,
+        ci_kpa=1200.0,
+        rear_section_width_m=0.34,
+        rear_overall_diameter_m=1.30,
+    )
+    assert solution.converged is True
+    # Interpolation lands at or below the grid point that first exceeded draft,
+    # and no lower than the grid point before it.
+    assert solution.stepped_slip_pct - 0.1 <= solution.slip_pct <= solution.stepped_slip_pct
+    # Self-consistency: mu and pull correspond to the reported slip.
+    assert solution.mu == pytest.approx(
+        net_traction_coefficient(solution.bn_rear, solution.slip_pct / 100.0)
+    )
+    assert solution.pull_n == pytest.approx(solution.mu * rr_n)
+    # And that pull is essentially the draft -- which is the point of interpolating.
+    assert solution.pull_n == pytest.approx(draft_n, rel=2e-3)
 
 
 def test_solve_slip_starts_at_two_percent_when_traction_is_ample():
@@ -324,138 +395,147 @@ def test_solve_slip_caps_at_max_and_reports_unconverged_for_impossible_draft():
 
 
 def test_front_ballast_zero_when_kwef_already_sufficient():
-    kg, feasible = front_ballast_required_kg(
-        kwef=0.25,
-        tractor_weight_n=23544.0,
-        rsf_n=8829.0,
-        draft_n=1350.0,
-        yd_m=0.10,
-        implement_weight_n=3139.2,
-        py_n=202.5,
-        cg_distance_from_hitch_m=0.8,
-        hitch_distance_from_rear_m=0.5,
-        er_m=0.058,
-        ef_m=0.040,
-        wheelbase_m=2.3,
+    wt = 23544.0
+    # Front axle already carries 25% of tractor weight -> nothing to add.
+    kg, reachable = front_ballast_required_kg(
+        tractor_weight_n=wt,
+        rf_for_added_weight_n=lambda extra_n: 0.25 * (wt + extra_n),
     )
     assert kg == 0.0
-    assert feasible is True
+    assert reachable is True
 
 
-def test_front_ballast_infeasible_case_is_flagged_not_silently_zero():
-    # For some geometries DSS Eq. 3.7 has no finite solution (RHS saturates below
-    # the ever-growing LHS target) -- verified analytically for this input set.
-    # The solver must report feasible=False rather than a falsely-precise number,
-    # and the full pipeline must surface a warning rather than staying silent.
-    tractor_weight_n = 23544.0
-    rsf_n = 3000.0
-    kwef = rsf_n / tractor_weight_n
-    assert kwef < 0.20
+def test_front_ballast_solves_to_the_kwef_target():
+    """The returned mass must actually put Kwef on 0.20, per the balance given."""
+    wt = 23544.0
+    # Half of any added ballast reaches the front axle.
+    rf = lambda extra_n: 0.10 * wt + 0.5 * extra_n
+    kg, reachable = front_ballast_required_kg(tractor_weight_n=wt, rf_for_added_weight_n=rf)
+    assert reachable is True
+    added_n = kg * GRAVITY
+    assert rf(added_n) / (wt + added_n) == pytest.approx(0.20, abs=1e-6)
 
-    kg, feasible = front_ballast_required_kg(
-        kwef=kwef,
-        tractor_weight_n=tractor_weight_n,
-        rsf_n=rsf_n,
-        draft_n=1350.0,
-        yd_m=0.10,
-        implement_weight_n=3139.2,
-        py_n=202.5,
-        cg_distance_from_hitch_m=0.8,
-        hitch_distance_from_rear_m=0.5,
-        er_m=0.058,
-        ef_m=0.040,
-        wheelbase_m=2.3,
+
+def test_front_ballast_unreachable_target_is_flagged_not_silently_zero():
+    """When ballast cannot raise Kwef to 0.20, report it rather than guess.
+
+    Here every added Newton goes to the rear axle, so Rf is fixed and
+    Rf/(Wt + BRf) falls monotonically towards zero -- the target is genuinely
+    unreachable, and the solver must say so instead of returning its ceiling.
+    """
+    wt = 23544.0
+    kg, reachable = front_ballast_required_kg(
+        tractor_weight_n=wt,
+        rf_for_added_weight_n=lambda extra_n: 0.10 * wt,
     )
-    assert feasible is False
-    assert kg > 0
+    assert reachable is False
+    assert kg is None
 
 
-def test_calculate_legacy_performance_warns_when_front_ballast_target_unreachable():
+def test_front_ballast_is_solvable_where_the_old_equation_37_saturated():
+    """A rear-biased CG that DSS Eq. 3.7 declared unreachable now has a solution.
+
+    Eq. 3.7's implicit form saturated below its own target for geometries like
+    this one and reported "no finite ballast reaches Kwef=0.20". Re-solving the
+    actual axle balance instead -- as both reference implementations do -- yields
+    a finite answer, so the pipeline reports a mass and emits no warning.
+
+    Note the mass is large (thousands of kg) because the model adds ballast at the
+    tractor CG rather than ahead of the front axle; see the module notes.
+    """
     results = calculate_legacy_performance(make_inputs(cg_distance_from_rear_m=0.6))
     assert results["front_weight_utilization"] < 0.20
-    assert any("Kwef=0.20" in w for w in results["warnings"])
+    assert results["ballast_front_required"] is not None
+    assert results["ballast_front_required"] > 0
+    assert not any("Kwef=0.20" in w for w in results["warnings"])
 
 
 def test_rear_ballast_positive_when_slip_exceeds_target_and_hits_fixed_point():
-    # A wide/deep implement on a modest tractor pushes slip above the 15% target
-    # (verified: this combination converges at ~18.6% slip), which must trigger
-    # the DSS Eq. 3.8/3.9 rear-ballast solve.
-    results = calculate_legacy_performance(
-        make_inputs(width_m=5.5, depth_cm=35.0, pto_power_kw=70.0)
-    )
+    # A deeper cut pushes slip above the 15% target (verified: this combination
+    # converges at ~17.6% slip), which must trigger the DSS Eq. 3.8/3.9
+    # rear-ballast solve while still converging.
+    results = calculate_legacy_performance(make_inputs(depth_cm=13.0))
     assert results["converged"] is True
     assert results["slip"] > 15.0
     assert results["ballast_rear_required"] > 0.0
 
 
 def test_rear_ballast_also_triggered_by_soft_soil():
-    # Same effect reached through a low cone index rather than a bigger implement:
-    # Bn falls, traction falls, slip climbs past the 15% target.
+    # Same effect reached through a low cone index rather than a deeper cut:
+    # Bn falls, traction falls, slip climbs past the 15% target (~18.7%).
     results = calculate_legacy_performance(
-        make_inputs(width_m=4.8, depth_cm=35.0, pto_power_kw=70.0, cone_index_kpa=600.0)
+        make_inputs(depth_cm=12.0, pto_power_kw=70.0, cone_index_kpa=600.0)
     )
     assert results["converged"] is True
     assert results["slip"] > 15.0
     assert results["ballast_rear_required"] > 0.0
 
 
-def test_rear_ballast_zero_when_slip_within_target():
-    assert rear_ballast_required_kg(
-        slip_pct=10.0,
+def test_rear_ballast_zero_when_axle_load_already_sufficient():
+    """No early return on slip: R' simply lands below Rr and max() yields 0."""
+    kg, problem = rear_ballast_required_kg(
         draft_n=1350.0,
         rear_axle_load_n=9000.0,
-        rsr_n=14715.0,
         ci_kpa=1200.0,
         rear_section_width_m=0.34,
         rear_overall_diameter_m=1.30,
-        yd_m=0.10,
-        implement_weight_n=3139.2,
-        py_n=202.5,
-        cg_distance_from_hitch_m=0.8,
-        hitch_distance_from_rear_m=0.5,
-        tractor_weight_n=23544.0,
-        er_m=0.058,
-        ef_m=0.040,
-        wheelbase_m=2.3,
-    ) == 0.0
+    )
+    assert problem is None
+    assert kg == 0.0
 
 
-def test_rear_ballast_r_prime_fixed_point_satisfies_r_prime_equals_d_over_mu():
-    """DSS Eq. 3.9: R' = D / mu'(S=0.15, Bn evaluated at W = R'/2).
+def test_rear_ballast_is_the_shortfall_against_the_required_axle_load():
+    """BRr = (R' - Rr)/g, with R' = D / mu'(target slip, Bn at W = R'/2).
 
-    The solver's converged R' is recovered from the reported BRr by inverting
-    Eq. 3.8, then checked against the defining relation.
+    Recovers R' from the reported mass and checks it against that defining
+    relation -- the same expression both reference implementations use.
     """
-    draft_n = 15000.0
-    geom = dict(
-        rsr_n=14715.0, yd_m=0.10, implement_weight_n=3139.2, py_n=202.5,
-        cg_distance_from_hitch_m=0.8, hitch_distance_from_rear_m=0.5,
-        tractor_weight_n=23544.0, er_m=0.058, ef_m=0.040, wheelbase_m=2.3,
-    )
-    br_r_kg = rear_ballast_required_kg(
-        slip_pct=18.0,
+    draft_n, rear_axle_load_n = 15000.0, 9000.0
+    kg, problem = rear_ballast_required_kg(
         draft_n=draft_n,
-        rear_axle_load_n=9000.0,
+        rear_axle_load_n=rear_axle_load_n,
         ci_kpa=1200.0,
         rear_section_width_m=0.34,
         rear_overall_diameter_m=1.30,
-        **geom,
     )
-    assert br_r_kg > 0.0
+    assert problem is None
+    assert kg > 0.0
 
-    # Invert Eq. 3.8 for R'.
-    br_r_n = br_r_kg * 9.81
-    r_prime = (
-        br_r_n * (geom["wheelbase_m"] + geom["ef_m"])
-        - draft_n * geom["yd_m"]
-        + geom["rsr_n"] * geom["wheelbase_m"]
-        + geom["tractor_weight_n"] * geom["ef_m"]
-        + (geom["implement_weight_n"] + geom["py_n"])
-        * (geom["cg_distance_from_hitch_m"] + geom["hitch_distance_from_rear_m"] + geom["er_m"])
-    ) / (geom["wheelbase_m"] - geom["er_m"] + geom["ef_m"])
-
+    r_prime = kg * GRAVITY + rear_axle_load_n
     mu_prime = net_traction_coefficient(mobility_number(1200.0, 0.34, 1.30, r_prime / 2.0), 0.15)
     assert r_prime == pytest.approx(draft_n / mu_prime, rel=1e-6)
+
+
+def test_rear_ballast_honours_a_non_default_target_slip():
+    """Active-passive sizes at the solved slip (DSS Eq. 5.12/5.13), not 15%."""
+    common = dict(
+        draft_n=15000.0, rear_axle_load_n=9000.0, ci_kpa=1200.0,
+        rear_section_width_m=0.34, rear_overall_diameter_m=1.30,
+    )
+    at_default, _ = rear_ballast_required_kg(**common)          # 15% target
+    at_low, _ = rear_ballast_required_kg(**common, target_slip_fraction=0.10)
+    at_high, _ = rear_ballast_required_kg(**common, target_slip_fraction=0.20)
+    # Less slip allowed -> less traction available -> more axle load needed.
+    assert at_high < at_default < at_low
+
+
+def test_rear_ballast_reports_infeasibility_instead_of_raising():
+    """Soft soil under a heavy axle cannot develop the pull at the target slip.
+
+    That is a real verdict, not a crash: the solver must report it and return no
+    number, so the caller keeps the rest of the simulation (draft, slip, power,
+    fuel) as the evidence for it. Mirrors `front_ballast_required_kg`.
+    """
+    kg, problem = rear_ballast_required_kg(
+        draft_n=25000.0,
+        rear_axle_load_n=40000.0,
+        ci_kpa=300.0,
+        rear_section_width_m=0.24,
+        rear_overall_diameter_m=0.90,
+    )
+    assert kg is None
+    assert problem is not None
+    assert "could not be sized" in problem
 
 
 # --- Engine-torque pull limit, Pet (DSS Eq. 3.4) ---------------------------------------
@@ -502,8 +582,16 @@ def test_non_positive_pet_is_reported_as_a_formula_artefact_not_an_engine_limit(
 
 
 def test_pet_reports_a_genuine_engine_limit_when_the_thrust_term_is_physical():
-    """With enough torque to clear motion resistance, the real limit message applies."""
-    results = calculate_legacy_performance(make_inputs(max_engine_torque_nm=1200.0))
+    """With enough torque to clear motion resistance, the real limit message applies.
+
+    The torque figures here and below are synthetic: Eq. 3.4 omits the transmission
+    gear reduction (see `engine_torque_limited_pull_n`), so the values needed to put
+    Pet either side of the draft are far above any real engine. They are chosen
+    against the corrected Eq. 3.1 draft (9000 N at 10 cm).
+    """
+    results = calculate_legacy_performance(
+        make_inputs(depth_cm=10.0, max_engine_torque_nm=3000.0)
+    )
     pet = results["engine_torque_limited_pull"]
     assert 0 < pet < results["draft_force"]
     pet_warnings = [w for w in results["warnings"] if "Engine-torque pull limit" in w]
@@ -512,7 +600,9 @@ def test_pet_reports_a_genuine_engine_limit_when_the_thrust_term_is_physical():
 
 
 def test_ample_engine_torque_produces_no_pet_warning():
-    results = calculate_legacy_performance(make_inputs(max_engine_torque_nm=5000.0))
+    results = calculate_legacy_performance(
+        make_inputs(depth_cm=10.0, max_engine_torque_nm=12000.0)
+    )
     assert results["engine_torque_limited_pull"] > results["draft_force"]
     assert not any("Engine-torque pull limit" in w for w in results["warnings"])
 
@@ -547,9 +637,13 @@ def test_put_load_status_thresholds(put_pct, expected):
 
 
 def test_calculate_legacy_performance_end_to_end_converges_and_is_sane():
-    results = calculate_legacy_performance(make_inputs())
+    # 10 cm rather than the fixture default of 15 cm: at 15 cm this 1.5 m mouldboard
+    # genuinely overloads the 45 kW / 2700 kg tractor (slip pins at the 20% cap), which
+    # is the correct physical answer but not what a "converges and is sane" test should
+    # be exercising. 10 cm is a realistic working depth for this pairing.
+    results = calculate_legacy_performance(make_inputs(depth_cm=10.0))
 
-    assert results["draft_force"] == pytest.approx(1350.0)
+    assert results["draft_force"] == pytest.approx(9000.0)
     assert results["converged"] is True
     assert results["warnings"] == []
     assert 2.0 <= results["slip"] <= 20.0
@@ -568,14 +662,15 @@ def test_calculate_legacy_performance_end_to_end_converges_and_is_sane():
 
 def test_calculate_legacy_performance_intermediates_chain_together():
     """Spot-check the DSS chain end to end, not just the final numbers."""
-    results = calculate_legacy_performance(make_inputs())
+    results = calculate_legacy_performance(make_inputs(depth_cm=10.0))
     s = 5.0
 
     # Bn = CI*b*d/(Rr/2 in kN)
     assert results["legacy_mobility_number_rear"] == pytest.approx(
         mobility_number(1200.0, 0.34, 1.30, results["legacy_rear_axle_load_n"] / 2.0)
     )
-    # mu_g = 0.88(1-e^-0.1Bn); TE = mu(1-S)/mu_g
+    # mu_g = 0.88(1-e^-0.1Bn) is the Brixius envelope; TE = mu(1-S)/GT, where GT
+    # is the gross traction ratio developed AT the operating slip, not the envelope.
     assert results["legacy_gross_traction_ratio"] == pytest.approx(
         gross_traction_ratio(results["legacy_mobility_number_rear"])
     )
@@ -584,6 +679,7 @@ def test_calculate_legacy_performance_intermediates_chain_together():
             results["coefficient_net_traction"],
             results["legacy_gross_traction_ratio"],
             results["slip"] / 100.0,
+            bn_rear=results["legacy_mobility_number_rear"],
         )
     )
     # DBp = D*S; Ptr = DBp/(TE*eta_t); Put = Ptr/(Pt(1-fs))*100
@@ -640,3 +736,273 @@ def test_calculate_legacy_performance_underpowered_tractor_reports_overloaded():
         make_inputs(pto_power_kw=12.0, width_m=3.0, depth_cm=30.0)
     )
     assert results["status_message"] in ("Tractor is Overloaded", "Not Recommended", "Unstable")
+
+
+# --- Brixius tractive efficiency -------------------------------------------
+
+
+def test_net_traction_is_brixius_gross_minus_motion_resistance():
+    """`mu` must equal Brixius GT - MR exactly.
+
+    This is what identifies the traction model, and therefore what fixes the
+    denominator tractive efficiency has to use.
+    """
+    bn, s = 48.7, 0.10
+    mu_g = gross_traction_ratio(bn)
+    gt = 0.88 * (1 - math.exp(-0.1 * bn)) * (1 - math.exp(-7.5 * s)) + 0.04
+    mr = 0.04 + 1.0 / bn + 0.5 * s / math.sqrt(bn)
+    assert gross_traction_at_slip(bn, s) == pytest.approx(gt)
+    assert net_traction_coefficient(bn, s, mu_g=mu_g) == pytest.approx(gt - mr)
+
+
+def test_tractive_efficiency_uses_gross_traction_at_slip_not_the_envelope():
+    bn, s = 48.7, 0.10
+    mu_g = gross_traction_ratio(bn)
+    mu = net_traction_coefficient(bn, s, mu_g=mu_g)
+
+    te = traction_efficiency_percent(mu, mu_g, s, bn_rear=bn)
+    assert te == pytest.approx((mu / gross_traction_at_slip(bn, s)) * (1 - s) * 100.0)
+
+    # Field-measured TE for an agricultural tyre sits near 70-80% at working
+    # slip. The old envelope denominator gave ~45% here, which is why it was wrong.
+    assert 70.0 < te < 80.0
+    assert (mu * (1 - s) / mu_g) * 100.0 < 50.0
+    assert traction_efficiency_percent(mu, mu_g, s, bn_rear=bn) < 100.0
+
+
+def test_tractive_efficiency_peaks_at_a_working_slip():
+    """TE must have an optimum -- a DSS that cannot find one cannot advise on slip.
+
+    With the envelope as denominator TE rises monotonically and no optimum
+    exists; with the correct GT it peaks in the 8-15% band.
+    """
+    bn = 48.7
+    mu_g = gross_traction_ratio(bn)
+
+    def te(slip_fraction: float) -> float:
+        mu = net_traction_coefficient(bn, slip_fraction, mu_g=mu_g)
+        return traction_efficiency_percent(mu, mu_g, slip_fraction, bn_rear=bn)
+
+    grid = [i / 1000.0 for i in range(10, 251)]  # 1% .. 25%
+    best = max(grid, key=te)
+    assert 0.08 <= best <= 0.15
+    assert te(best) > te(0.02) and te(best) > te(0.25)
+
+
+# --- Eq. 3.1 `W`: metres or tool count --------------------------------------
+
+
+def test_draft_width_is_metres_for_full_width_tools():
+    for it in (ImplementType.MB_PLOUGH, ImplementType.DISC_PLOUGH, ImplementType.DISC_HARROW):
+        assert draft_width_parameter(it, 1.8, 9) == pytest.approx(1.8)
+
+
+def test_draft_width_is_the_tool_count_for_cultivators():
+    assert draft_width_parameter(ImplementType.CULTIVATOR, 2.2, 9) == pytest.approx(9.0)
+
+
+def test_draft_width_rejects_a_missing_tool_count():
+    """Refusing beats silently substituting the width.
+
+    An earlier revision fell back to metres so rows predating the column kept
+    running. That produces a meaningless answer rather than a merely understated
+    one -- see `test_missing_tool_count_would_have_nearly_cancelled_active_draft`.
+    """
+    with pytest.raises(ValueError, match="number_of_tools"):
+        draft_width_parameter(ImplementType.CULTIVATOR, 2.2, None)
+
+
+def test_draft_width_ignores_the_tool_count_for_full_width_tools():
+    """Ploughs and harrows must be unaffected, tool count present or not."""
+    for it in (ImplementType.MB_PLOUGH, ImplementType.DISC_PLOUGH, ImplementType.DISC_HARROW):
+        assert draft_width_parameter(it, 1.8, None) == pytest.approx(1.8)
+        assert draft_width_parameter(it, 1.8, 9) == pytest.approx(1.8)
+
+
+def test_draft_width_rejects_a_nonsensical_tool_count():
+    with pytest.raises(ValueError):
+        draft_width_parameter(ImplementType.CULTIVATOR, 2.2, 0)
+
+
+def test_cultivator_draft_per_metre_is_physically_plausible():
+    """W-in-metres makes draft/m identical at every size, which carries no
+    information and lands ~4x below a disc harrow. The tool count fixes both."""
+    common = dict(
+        implement_type=ImplementType.CULTIVATOR,
+        asae_param_a=32.0, asae_param_b=1.9, asae_param_c=0.0,
+        soil_texture=SoilTexture.MEDIUM, speed_kmh=4.0, depth_cm=15.0,
+        vertical_horizontal_ratio=0.2,
+    )
+    per_metre = []
+    for width, tools in ((2.2, 9), (3.13, 13), (4.15, 17)):
+        d = estimate_draft_force(make_inputs(width_m=width, number_of_tools=tools, **common))
+        per_metre.append(d / width)
+    # Draft per metre must now vary only through tine spacing, and sit between a
+    # disc plough (~1975 N/m) and a disc harrow (~4050 N/m).
+    for v in per_metre:
+        assert 1500.0 < v < 4500.0
+    assert max(per_metre) - min(per_metre) < 0.05 * max(per_metre)
+
+
+# --- Front lift is answered with ballast, not refused ------------------------
+
+
+def test_front_lift_returns_a_ballasted_result_instead_of_raising():
+    # A heavy, far-hitched implement on a light tractor lifts the front end.
+    inputs = make_inputs(
+        front_axle_weight_kg=315.0, rear_axle_weight_kg=440.0, wheelbase_m=1.42,
+        cg_distance_from_rear_m=0.5925, cg_distance_from_hitch_m=0.55,
+        width_m=1.5, weight_kg=225.0, depth_cm=20.0,
+    )
+    results = calculate_legacy_performance(inputs)
+
+    assert results["infeasible_without_ballast"] is True
+    assert results["stabilising_front_ballast_kg"] > 0
+    assert results["legacy_front_axle_load_n"] > 0
+    assert any("Front axle lifts" in w for w in results["warnings"])
+    # It still produces a usable answer rather than a dead end.
+    assert results["power_utilization"] > 0
+    assert results["draft_force"] > 0
+
+
+def test_a_comfortable_pairing_reports_no_stabilising_ballast():
+    results = calculate_legacy_performance(make_inputs(depth_cm=10.0))
+    assert results["infeasible_without_ballast"] is False
+    assert results["stabilising_front_ballast_kg"] == pytest.approx(0.0)
+
+
+def test_rear_axle_lift_still_raises_because_ballast_cannot_fix_it():
+    """Front ballast moves load OFF the driven axle, so rear lift is not rescuable."""
+    with pytest.raises(ValueError, match=r"rear \(driven\) axle"):
+        resolve_axle_loads(
+            rear_axle_load_n=-100.0,
+            front_axle_load_n=5000.0,
+            tractor_weight_n=20000.0,
+            axle_loads_for_added_weight=lambda extra_n: (-100.0, 5000.0 + extra_n),
+            warnings=[],
+        )
+
+
+def test_front_lift_raises_only_when_no_ballast_can_fix_it():
+    """A tractor that cannot reach the steering-weight target at any ballast."""
+    with pytest.raises(ValueError, match="no amount of front ballast"):
+        resolve_axle_loads(
+            rear_axle_load_n=5000.0,
+            front_axle_load_n=-10.0,
+            tractor_weight_n=20000.0,
+            # Front load never rises with ballast -> target unreachable.
+            axle_loads_for_added_weight=lambda extra_n: (5000.0, -10.0),
+            warnings=[],
+        )
+
+
+def test_resolve_axle_loads_passes_a_healthy_pair_through_untouched():
+    warnings: list = []
+    got = resolve_axle_loads(
+        rear_axle_load_n=14000.0,
+        front_axle_load_n=6000.0,
+        tractor_weight_n=20000.0,
+        axle_loads_for_added_weight=lambda extra_n: (14000.0, 6000.0 + extra_n),
+        warnings=warnings,
+    )
+    assert (got.rear_axle_load_n, got.front_axle_load_n) == (14000.0, 6000.0)
+    assert got.stabilising_ballast_kg == 0.0
+    assert got.infeasible_without_ballast is False
+    assert warnings == []
+
+
+# --- Documented divergences from the reference implementations ---------------
+#
+# The engine is bit-identical to `docs/tillage_dss (2).html` in every formula, in
+# all three modes. Exactly four things make the outputs differ, and each is a
+# deliberate decision recorded in SIMULATION_ENGINE_FORMULAS.md. These tests fail
+# if any of them is changed silently.
+
+
+def test_reference_te_basis_is_reported_but_drives_nothing():
+    """The known-incorrect envelope-denominator TE is a diagnostic only."""
+    results = calculate_legacy_performance(make_inputs(depth_cm=10.0))
+    bn = results["legacy_mobility_number_rear"]
+    mu = results["coefficient_net_traction"]
+    mu_g = results["legacy_gross_traction_ratio"]
+    s = results["slip"] / 100.0
+
+    assert results["traction_efficiency_reference_basis"] == pytest.approx(
+        mu * (1 - s) / mu_g * 100.0
+    )
+    assert results["gross_traction_at_slip"] == pytest.approx(gross_traction_at_slip(bn, s))
+    # The reported TE uses the correct denominator, and the power chain follows it.
+    assert results["traction_efficiency"] == pytest.approx(
+        mu * (1 - s) / results["gross_traction_at_slip"] * 100.0
+    )
+    assert results["traction_efficiency"] > results["traction_efficiency_reference_basis"]
+    assert results["required_pto_power"] == pytest.approx(
+        results["drawbar_power"] / (results["traction_efficiency"] / 100.0 * 0.86)
+    )
+
+
+def test_fi_is_global_and_matches_the_reference_stack():
+    """Fi is keyed on soil texture alone, matching the spreadsheet and the HTML.
+
+    The authority is the spreadsheet's "tractor and implement data" sheet, cells
+    D50:F53 -- a three-row Soil Type/Fi table with no implement dimension -- and
+    the HTML tool's texture selector, which hard-codes the same three values.
+
+    These are D497's *moldboard-plough* F row applied to every implement, so this
+    is a deliberate departure from D497's per-implement F rows (disc tools would
+    be 0.88/0.78, cultivators 0.85/0.65). It was chosen for cross-tool
+    consistency with the reference stack; see constants.FI_FACTOR_BY_TEXTURE.
+    """
+    from app.core.constants import FI_FACTOR_BY_TEXTURE as FI
+
+    assert FI == {"Fine": 1.0, "Medium": 0.70, "Coarse": 0.45}
+    # Flat: one value per texture, with no implement key anywhere in the table.
+    assert all(isinstance(v, float) for v in FI.values())
+
+    # And the lookup ignores the implement, for every passive class.
+    for texture in (SoilTexture.FINE, SoilTexture.MEDIUM, SoilTexture.COARSE):
+        applied = {
+            fi_factor(implement_type, texture)
+            for implement_type in (
+                ImplementType.MB_PLOUGH,
+                ImplementType.DISC_PLOUGH,
+                ImplementType.DISC_HARROW,
+                ImplementType.CULTIVATOR,
+            )
+        }
+        assert applied == {FI[texture.value]}
+
+
+def test_missing_tool_count_would_have_nearly_cancelled_active_draft():
+    """Why the missing tool count raises instead of falling back to metres.
+
+    In an active-passive combination `Deff = Dp + Da - Ta`. Substituting the
+    width in metres for a cultivator understates `Dp` roughly 4x, which here is
+    the same order as the rotor's forward thrust -- so `Deff` collapses to
+    nothing and the run SUCCEEDS with a plausible-looking verdict built on no
+    draft. That is why the fallback was removed; this pins the arithmetic.
+
+    `fi` is the global medium-soil factor. It was 0.85 (the old per-implement
+    cultivator value) while Fi was implement-keyed; under the global table the
+    understated draft no longer merely cancels the thrust but overshoots into
+    negative effective draft, which the engine rejects outright. The
+    demonstration is strictly stronger, so the bound below is one-sided.
+    """
+    fi, a, b, c = 0.70, 32.0, 1.9, 0.0
+    speed_kmh, depth_cm, width_m, tools = 4.0, 12.0, 2.2, 9
+
+    def draft(w: float) -> float:
+        return fi * (a + b * speed_kmh + c * speed_kmh**2) * w * depth_cm
+
+    correct = draft(float(tools))
+    substituted = draft(width_m)
+
+    # Rotavator 7 ft: eta_r 0.32, P_PTO 4.5 kW -> Ta = eta_r*P/V
+    thrust_n = 0.32 * 4500.0 / (speed_kmh / 3.6)
+    rotor_resistance_n = 420.0
+
+    assert correct / substituted == pytest.approx(float(tools) / width_m)
+    # Correct effective draft is a real, sizeable load...
+    assert (correct + rotor_resistance_n - thrust_n) > 2000.0
+    # ...whereas the substituted one collapses to nothing (here, past zero).
+    assert (substituted + rotor_resistance_n - thrust_n) < 50.0

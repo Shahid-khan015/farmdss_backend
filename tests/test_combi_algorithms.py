@@ -64,9 +64,13 @@ TOOL_1 = PassiveToolInputs(
     implement_type=ImplementType.MB_PLOUGH, width_m=1.0, weight_kg=250.0,
     cg_distance_from_hitch_m=0.6, asae_param_a=100.0, asae_param_b=50.0, asae_param_c=10.0,
 )
+# Real ASABE D497 secondary-tillage field-cultivator parameters. That row is
+# tabulated PER TOOL, so Eq. 3.1's W is `number_of_tools`, not `width_m`; the
+# width is still what field capacity and turning use.
 TOOL_2 = PassiveToolInputs(
     implement_type=ImplementType.CULTIVATOR, width_m=1.2, weight_kg=180.0,
-    cg_distance_from_hitch_m=1.0, asae_param_a=60.0, asae_param_b=25.0, asae_param_c=4.0,
+    cg_distance_from_hitch_m=1.0, asae_param_a=32.0, asae_param_b=1.9, asae_param_c=0.0,
+    number_of_tools=9,
 )
 
 
@@ -124,7 +128,7 @@ def test_passive_passive_draft_matches_each_tool_asae_equation():
     results = calculate_passive_passive_performance(make_pp_inputs())
     v = TRACTOR_COMMON["speed_kmh"]
     depth = TRACTOR_COMMON["depth_cm"]
-    expected_d1 = 1.0 * (100.0 + 50.0 * v + 10.0 * v**2) * TOOL_1.width_m * (depth / 10.0)  # Fine soil, Fi=1.0
+    expected_d1 = 1.0 * (100.0 + 50.0 * v + 10.0 * v**2) * TOOL_1.width_m * depth  # Fine soil, Fi=1.0
     assert results["draft_1"] == pytest.approx(expected_d1)
 
 
@@ -188,7 +192,10 @@ def test_excess_rotor_thrust_is_rejected_not_silently_broken():
     # A rotor whose thrust exceeds total resistance drives Deff <= 0, which would
     # otherwise cascade into negative drawbar power and a division by zero in the
     # fuel/efficiency chain -- must be a clear ValueError instead.
-    overpowered_rotor = make_rotor(pto_power_draw_kw=15.0, rotor_efficiency=0.35)
+    # 40 kW rather than 15: the corrected Eq. 3.1 raises the passive draft this thrust
+    # has to overcome (Dp ~= 8.4 kN here), so a bigger rotor is needed to drive Deff
+    # negative at all.
+    overpowered_rotor = make_rotor(pto_power_draw_kw=40.0, rotor_efficiency=0.35)
     with pytest.raises(ValueError, match="Effective draft"):
         calculate_active_passive_performance(make_ap_inputs(rotor=overpowered_rotor))
 
@@ -451,6 +458,7 @@ def test_passive_passive_reduces_exactly_to_the_single_implement_result():
         asae_param_a=0.0,
         asae_param_b=0.0,
         asae_param_c=0.0,
+        number_of_tools=9,
     )
     combi_result = calculate_passive_passive_performance(
         make_pp_inputs(tool_1=TOOL_1, tool_2=null_tool, interaction_coefficient=0.0)
@@ -462,7 +470,10 @@ def test_passive_passive_reduces_exactly_to_the_single_implement_result():
             width_m=TOOL_1.width_m,
             weight_kg=TOOL_1.weight_kg,
             cg_distance_from_hitch_m=TOOL_1.cg_distance_from_hitch_m,
-            vertical_horizontal_ratio=0.6,  # unused by the engine
+            # Must come from the same source as the combi path: Py/D is now read
+            # from the implement record, so a mismatch here would change Py and
+            # break the reduction for a reason unrelated to the combination model.
+            vertical_horizontal_ratio=TOOL_1.vertical_horizontal_ratio,
             asae_param_a=TOOL_1.asae_param_a,
             asae_param_b=TOOL_1.asae_param_b,
             asae_param_c=TOOL_1.asae_param_c,
@@ -488,6 +499,64 @@ def test_passive_passive_reduces_exactly_to_the_single_implement_result():
         "ballast_rear_required",
     ):
         assert combi_result[key] == pytest.approx(single_result[key]), key
+
+
+# --- Fi consistency across all three modes ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "texture,expected_fi",
+    [(SoilTexture.MEDIUM, 0.70), (SoilTexture.COARSE, 0.45)],
+)
+def test_fi_is_applied_identically_in_all_three_modes(texture, expected_fi):
+    """One global Fi, reached the same way by Single, PP and AP.
+
+    All three modes route through `legacy_algorithms.fi_factor`, so this is meant
+    to stay true by construction -- the test exists to catch a mode acquiring its
+    own lookup. Measured as draft(texture)/draft(fine), which isolates Fi: it is
+    the only term in Eq. 3.1 that texture touches.
+
+    Deliberately parametrised on MEDIUM and COARSE only. Every other test in this
+    module runs on FINE, where Fi = 1.0 both before and after the switch to a
+    global table -- so a mode that drifted would sail straight through them.
+
+    Active-passive is checked on `draft_passive` rather than `draft_force`:
+    Deff = Dp + Da - Ta also carries the rotor terms, which do not scale with Fi.
+    """
+    def ratio(run, key, **kwargs):
+        fine = run(soil_texture=SoilTexture.FINE, **kwargs)[key]
+        return run(soil_texture=texture, **kwargs)[key] / fine
+
+    def single(*, soil_texture):
+        tractor = dict(TRACTOR_COMMON, soil_texture=soil_texture)
+        return calculate_legacy_performance(
+            LegacyInputs(
+                **tractor,
+                implement_type=TOOL_1.implement_type,
+                width_m=TOOL_1.width_m,
+                weight_kg=TOOL_1.weight_kg,
+                cg_distance_from_hitch_m=TOOL_1.cg_distance_from_hitch_m,
+                vertical_horizontal_ratio=TOOL_1.vertical_horizontal_ratio,
+                asae_param_a=TOOL_1.asae_param_a,
+                asae_param_b=TOOL_1.asae_param_b,
+                asae_param_c=TOOL_1.asae_param_c,
+            )
+        )
+
+    def passive_passive(*, soil_texture):
+        return calculate_passive_passive_performance(make_pp_inputs(soil_texture=soil_texture))
+
+    def active_passive(*, soil_texture):
+        return calculate_active_passive_performance(make_ap_inputs(soil_texture=soil_texture))
+
+    assert ratio(single, "draft_force") == pytest.approx(expected_fi)
+    assert ratio(passive_passive, "draft_force") == pytest.approx(expected_fi)
+    assert ratio(active_passive, "draft_passive") == pytest.approx(expected_fi)
+
+    # Both tools of the pair scale together -- an MB plough and a cultivator,
+    # which had *different* Fi rows before this change (0.70 vs 0.85 in medium).
+    assert ratio(passive_passive, "draft_1") == pytest.approx(expected_fi)
+    assert ratio(passive_passive, "draft_2") == pytest.approx(expected_fi)
 
 
 # --- Wheel-numeric injection wiring (solve_slip / rear ballast) --------------
@@ -532,25 +601,14 @@ def test_rear_ballast_evaluates_wheel_numeric_at_half_the_trial_rear_load():
         return 40.0
 
     rear_ballast_required_kg(
-        slip_pct=18.0,
         draft_n=1350.0,
         rear_axle_load_n=2200.0,
-        rsr_n=14715.0,
         ci_kpa=1200.0,
         rear_section_width_m=0.34,
         rear_overall_diameter_m=1.30,
-        yd_m=0.10,
-        implement_weight_n=3139.2,
-        py_n=202.5,
-        cg_distance_from_hitch_m=0.8,
-        hitch_distance_from_rear_m=0.5,
-        tractor_weight_n=23544.0,
-        er_m=0.058,
-        ef_m=0.040,
-        wheelbase_m=2.3,
         mobility_fn=spy,
     )
-    # First evaluation is at the as-computed rear load; every call is at W = R'/2.
+    # The seed is max(Rr, D) -- here Rr -- and every call is at W = R'/2.
     assert seen[0] == pytest.approx(2200.0 / 2.0)
     assert all(w > 0 for w in seen)
 
@@ -617,20 +675,33 @@ def test_active_passive_rear_axle_load_adds_mpto_over_l_and_fv():
     )
 
 
-def test_active_passive_front_ballast_uses_the_closed_form_of_equation_5_11():
-    """BRf = (0.20*Wt - Rf)/0.80 -- distinct from the implicit Eq. 3.7 solve."""
+def test_active_passive_front_ballast_uses_the_shared_solver():
+    """Active-passive no longer has its own front-ballast closed form.
+
+    DSS Eq. 5.10/5.11 (`BRf = (0.20*Wt - Rf)/0.80`) assumed ballast lands entirely
+    on the front axle. The shared solver instead re-solves this mode's own
+    Eq. 3.5 balance -- including the rotor's `Weq + Fv` rear load -- so the
+    reported mass is the one that actually puts Kwef on 0.20 under the same
+    balance the axle loads themselves come from. Both references do it this way.
+    """
     # A heavy rotor set back from the hitch unloads the front axle below
     # Kwef = 0.20. Under the Section 3 balance every kilogram hung behind the rear
     # axle removes front-axle load, so this needs no exaggerated geometry.
     inputs = make_ap_inputs(rotor=make_rotor(weight_kg=900.0, cg_distance_from_hitch_m=1.2))
     results = calculate_active_passive_performance(inputs)
     assert results["front_weight_utilization"] < FRONT_BALLAST_TARGET_KWEF
+
+    ballast_kg = results["ballast_front_required"]
+    assert ballast_kg is not None and ballast_kg > 0
+
+    # The old closed form would have under-called it: it credits the whole mass to
+    # the front axle, where the real balance sends part of it rearward.
     wt_n = (TRACTOR_COMMON["front_axle_weight_kg"] + TRACTOR_COMMON["rear_axle_weight_kg"]) * GRAVITY
-    expected_kg = (
+    closed_form_kg = (
         (FRONT_BALLAST_TARGET_KWEF * wt_n - results["legacy_front_axle_load_n"])
         / (1.0 - FRONT_BALLAST_TARGET_KWEF)
     ) / GRAVITY
-    assert results["ballast_front_required"] == pytest.approx(expected_kg)
+    assert ballast_kg > closed_form_kg
 
 
 def test_active_passive_rear_ballast_matches_rreq_minus_rr():
@@ -799,7 +870,15 @@ def test_passive_passive_sweep_is_physically_coherent(label, overrides, ki):
     assert results["fuel_consumption_per_hectare"] > 0.0
     assert results["field_capacity_actual"] <= results["field_capacity_theoretical"]
     assert results["ballast_front_required"] >= 0.0
-    assert results["ballast_rear_required"] >= 0.0
+    # Rear ballast is None when the requirement genuinely cannot be sized -- the real
+    # outcome for the heaviest sweep cases, where the soil develops no net pull at the
+    # 15% target slip. That is reported with a warning rather than raised, so the rest
+    # of the result set survives. Both states are valid; a fabricated number is not.
+    rear_ballast = results["ballast_rear_required"]
+    if rear_ballast is None:
+        assert any("Rear ballast could not be sized" in w for w in results["warnings"])
+    else:
+        assert rear_ballast >= 0.0
 
 
 def test_passive_passive_draft_rises_with_depth_speed_and_width():

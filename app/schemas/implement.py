@@ -22,6 +22,7 @@ class ImplementBase(BaseModel):
     asae_param_a: Optional[Decimal] = Field(default=None)
     asae_param_b: Optional[Decimal] = Field(default=None)
     asae_param_c: Optional[Decimal] = Field(default=None)
+    number_of_tools: Optional[int] = Field(default=None, gt=0)
     working_width_m: Optional[float] = None
     hitch_type: Optional[str] = None
     preset_speed_kmh: Optional[float] = None
@@ -60,6 +61,7 @@ class ImplementUpdate(BaseModel):
     asae_param_a: Optional[Decimal] = None
     asae_param_b: Optional[Decimal] = None
     asae_param_c: Optional[Decimal] = None
+    number_of_tools: Optional[int] = None
     working_width_m: Optional[float] = None
     hitch_type: Optional[str] = None
     preset_speed_kmh: Optional[float] = None

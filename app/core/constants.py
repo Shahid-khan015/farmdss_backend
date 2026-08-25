@@ -48,25 +48,66 @@ BALLAST_SOLVER_TOLERANCE = 1e-4  # [IMPLEMENTATION-ASSUMPTION] solver tuning
 BALLAST_SOLVER_MAX_ITERATIONS = 200  # [IMPLEMENTATION-ASSUMPTION] solver tuning
 
 # --- Py/D ratio (vertical:horizontal soil-reaction ratio) by implement type ---
-# DSS spec: "Use this ratio Py/D as 0.15 for Moldboard plough, 0.40 for disk plough,
-# 0.50 for disc harrow and 0 for cultivator" (Kepner et al., 1978).  [DSS-EXACT]
+# [EXTERNAL-MODEL] Values from the reference implementations: the "Vertical to
+# Horizontal force ratio" row of `Tractor_Implement_Performance_Calculator
+# Updated.xlsx` (sheet 2, row 10) and the `PyD` field of `tillage_dss.html`'s
+# implement library. The two agree exactly.
+#
+# This is a FALLBACK only. Both references carry Py/D as a per-implement input,
+# not a per-type constant -- see `Implement.vertical_horizontal_ratio`, which the
+# engine now reads first. This table is used only when that column is NULL.
+#
+# Supersedes an earlier table (MB 0.15 / disc plough 0.40 / disc harrow 0.50 /
+# cultivator 0.0) attributed to Kepner et al. 1978 via the DSS document. Those
+# values disagree with both references on every row -- nearly inverted for the
+# disc tools and the cultivator -- and materially changed the axle-load split.
 PY_OVER_D_RATIO_BY_IMPLEMENT = {
-    "MB Plough": 0.15,
-    "Disc Plough": 0.40,
-    "Disc Harrow": 0.50,
-    "Cultivator": 0.0,
+    "MB Plough": 0.20,
+    "Disc Plough": 0.0,
+    "Disc Harrow": 0.0,
+    "Cultivator": 0.20,
 }
 
+# --- Eq. 3.1 `W`: width in metres, or number of tools ---  [EXTERNAL-MODEL]
+# ASABE D497 Table 1 does not use one unit for `W`. For full-width tools
+# (mouldboard/disc ploughs, disc harrows) `W` is the working width in metres.
+# For tined implements the row is tabulated *per tool*, so `W` is the number of
+# tools -- `A = 32, B = 1.9, C = 0` is D497's secondary-tillage field cultivator,
+# which is a per-tool row.
+#
+# Reading `W` as metres for a cultivator yields a draft of ~505 N/m at every
+# size -- the width cancels, so the figure carries no information -- against
+# ~1975 N/m for a disc plough and ~4050 N/m for a disc harrow. It also drops a
+# 9-tine cultivator's total draft below a rotavator's forward thrust, which makes
+# the effective draft of an active-passive combination non-positive and fails the
+# run outright. Per-tool gives a consistent ~2070 N/m across sizes.
+#
+# Both reference implementations use metres for every implement; this is a
+# deliberate, documented divergence from them. Field capacity, turning and swath
+# always use the width in metres -- only Eq. 3.1's `W` is affected.
+DRAFT_WIDTH_IS_TOOL_COUNT = frozenset({"Cultivator"})
+
 # --- Soil-texture adjustment factor F (DSS Eq. 3.1) ---
-# [LEGACY] The document names the texture classes (fine/medium/coarse) but gives
-# no numeric table; these values are carried over from the pre-existing codebase
-# and have no cited source. Keyed by ImplementType.value / SoilTexture.value.
-FI_FACTOR_BY_IMPLEMENT_AND_TEXTURE = {
-    "MB Plough": {"Fine": 1.0, "Medium": 0.70, "Coarse": 0.45},
-    "Disc Plough": {"Fine": 1.0, "Medium": 0.88, "Coarse": 0.78},
-    "Disc Harrow": {"Fine": 1.0, "Medium": 0.88, "Coarse": 0.78},
-    "Cultivator": {"Fine": 1.0, "Medium": 0.85, "Coarse": 0.65},
-}
+# [REFERENCE-ALIGNED] One factor per soil texture, applied to every implement.
+# Keyed by SoilTexture.value.
+#
+# This is the reference stack's Fi, adopted deliberately so that the engine, the
+# spreadsheet and the HTML tool agree. Its authority is the spreadsheet
+# `docs/Tractor_Implement_Performance_Calculator Updated.xlsx`, sheet "tractor
+# and implement data" cells D50:F53 -- a three-row Soil Type/Fi table with no
+# implement dimension -- and `docs/tillage_dss (2).html`, which hard-codes the
+# same three values in its texture selector.
+#
+# Known departure from ASABE D497: D497 Table 1 carries its own F1/F2/F3 per
+# implement row (disc tools 1.0/0.88/0.78, cultivators 1.0/0.85/0.65), and these
+# three values are specifically its *moldboard-plough* row. Using them for every
+# implement therefore understates draft on non-moldboard tools in non-fine soil
+# -- most steeply for disc tools in coarse soil, where Fi falls 0.78 -> 0.45 and
+# draft with it (0.577x), carrying slip, power utilisation and fuel down with it.
+# MB Plough is unaffected in every texture, as is fine soil for every implement.
+# This is an accepted, deliberate trade of D497 fidelity for cross-tool
+# consistency; see docs/SIMULATION_ENGINE_FORMULAS.md.
+FI_FACTOR_BY_TEXTURE = {"Fine": 1.0, "Medium": 0.70, "Coarse": 0.45}
 
 # --- ASABE (2001) specific fuel consumption ---  [DSS-EXACT]
 # SFC = 2.64X + 3.91 - 0.203*sqrt(738X + 173), L/kW-h
@@ -75,6 +116,12 @@ SFC_COEFF_B = 3.91
 SFC_COEFF_C = 0.203
 SFC_RADICAND_COEFF = 738.0
 SFC_RADICAND_OFFSET = 173.0
+
+# --- Minimum rated PTO power accepted by input validation ---
+# A floor to catch missing/nonsense input, not an equipment-class restriction.
+# Indian power tillers start around 5 kW and the library's smallest tractor is
+# 6.6 kW, so 10 kW (the previous value) rejected our own catalogue.
+PTO_POWER_MIN_KW = 5.0
 
 # --- Power-utilization status bands (DSS "Check Put value" table) ---  [DSS-EXACT]
 PUT_PROPERLY_LOADED_RANGE = (95.0, 100.0)
@@ -87,8 +134,11 @@ TURNING_TIME_COEFF_WIDTH_OVER_SPEED = 2.61
 TURNING_TIME_COEFF_SPEED = 1.41
 TURNING_TIME_CLAMP = (8.0, 45.0)  # seconds
 FIELD_EFFICIENCY_CLAMP = (50.0, 95.0)  # percent
-FUEL_L_PER_HA_CLAMP = (0.0, 200.0)
 OVERALL_EFFICIENCY_CLAMP = (0.0, 100.0)
+# NOTE: there is deliberately no upper clamp on fuel per hectare. An earlier
+# FUEL_L_PER_HA_CLAMP = (0.0, 200.0) capped it, which neither reference does
+# (xlsx `Fuel_Lha = Fuel_Lh / FCact`; tillage_dss.html floors at 0 only). A cap
+# hides a genuinely heavy pairing behind a plausible-looking number.
 
 # --- Input ranges the DSS document states explicitly ---
 KI_RANGE = (0.0, 0.25)  # [DSS-EXACT] tool-interaction coefficient, Section 4

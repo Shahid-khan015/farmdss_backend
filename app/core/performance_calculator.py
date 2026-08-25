@@ -40,7 +40,8 @@ class PerformanceInputs:
     width_m: float
     weight_kg: float
     cg_distance_from_hitch_m: float
-    vertical_horizontal_ratio: float
+    #: Py/D; None falls back to the per-implement-type table.
+    vertical_horizontal_ratio: Optional[float]
     asae_param_a: float
     asae_param_b: float
     asae_param_c: float
@@ -55,6 +56,9 @@ class PerformanceInputs:
 
     # Optional: enables the DSS Eq. 3.4 engine-torque pull limit (Pet) diagnostic.
     max_engine_torque_nm: Optional[float] = None
+
+    #: Eq. 3.1's `W` for per-tool implement classes; see LegacyInputs.
+    number_of_tools: Optional[int] = None
 
 
 def _to_legacy_inputs(inputs: PerformanceInputs) -> LegacyInputs:

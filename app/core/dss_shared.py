@@ -25,7 +25,6 @@ from app.core.constants import (
     DIESEL_CALORIFIC_VALUE,
     DRAFT_DEPTH_ACTION_FRACTION,
     FIELD_EFFICIENCY_CLAMP,
-    FUEL_L_PER_HA_CLAMP,
     OVERALL_EFFICIENCY_CLAMP,
     PUT_PROPERLY_LOADED_RANGE,
     SFC_COEFF_A,
@@ -119,11 +118,20 @@ def draft_force_n(
 ) -> float:
     """Implement draft force D, N -- DSS Eq. 3.1 [DSS-EXACT]:
 
-        D = F * (A + B*S + C*S^2) * W * (T/10)
+        D = F * (A + B*S + C*S^2) * W * T
 
-    Units: `S` in km/h, `W` in m, `T` in cm; `F` is the dimensionless soil-texture
-    factor. The `/10` is a real denominator in the source equation (verified in
-    the document's OMML markup), not a unit conversion added here.
+    Units: `D` in N, `S` in km/h, `W` in m, `T` in cm; `F` is the dimensionless
+    soil-texture factor. There is **no divisor on T** -- the units above are what
+    make the equation balance, and this is exactly the ASABE D497 draft model
+    (`D = F_i[A + B*S + C*S^2]*W*T`) the DSS document is transcribing.
+
+    An earlier transcription carried a `/10` on the depth term. It was wrong, and
+    wrong by a full order of magnitude: it made every draft -- and therefore every
+    axle load, slip, power, fuel and ballast figure -- 10x too small. The symptom
+    was that the slip solver converged on its very first 2% trial step for every
+    realistic input, pinning tractive efficiency near 10% (real tillage is 50-75%)
+    and reporting "Underloaded" for every tractor/implement pairing, so the DSS
+    could not discriminate between pairings at all. Do not reintroduce it.
 
     This is the single transcription of Eq. 3.1 in the engine; the single-tool,
     passive-passive and active-passive paths all call it.
@@ -136,7 +144,7 @@ def draft_force_n(
         fi
         * (asae_param_a + asae_param_b * speed_kmh + asae_param_c * (speed_kmh**2))
         * width_m
-        * (depth_cm / 10.0),
+        * depth_cm,
     )
 
 
@@ -329,7 +337,9 @@ def power_and_fuel(
     sfc = specific_fuel_consumption_l_per_kwh(x_fraction)
     fuel_lph = sfc * pdb_kw
     fuel_lph_pto_basis = sfc * total_pto_kw
-    fuel_l_per_ha = clamp(safe_div("fuel consumption per hectare", fuel_lph, fc_ac), *FUEL_L_PER_HA_CLAMP)
+    # Floored at 0, never capped: both reference implementations report the raw
+    # ratio, and an upper cap would disguise a genuinely over-worked pairing.
+    fuel_l_per_ha = max(0.0, safe_div("fuel consumption per hectare", fuel_lph, fc_ac))
 
     if fuel_l_per_ha > 0:
         overall_pct = clamp(

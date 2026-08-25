@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.constants import PTO_POWER_MIN_KW
+
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
@@ -58,15 +60,19 @@ def validate_operating_ranges(inputs: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
 
+    # The floor exists to reject missing/nonsense power, not to exclude small
+    # tractors. It sat at 10 kW, which rejected the catalogue's own 6.6 kW
+    # Captain DI 2600 outright -- every simulation against it 422'd. Indian
+    # power tillers start around 5 kW, so that is the defensible bound.
     pto_power = _to_float(inputs.get("pto_power"))
-    if pto_power is None or pto_power <= 10.0:
+    if pto_power is None or pto_power < PTO_POWER_MIN_KW:
         errors.append(
             {
                 "field": "pto_power",
                 "code": "out_of_range",
-                "message": "pto_power must be greater than 10 kW.",
+                "message": "pto_power must be at least {0:g} kW.".format(PTO_POWER_MIN_KW),
                 "value": pto_power,
-                "range": {"min": 10.0, "exclusive_min": True, "unit": "kW"},
+                "range": {"min": PTO_POWER_MIN_KW, "unit": "kW"},
             }
         )
     return errors
@@ -89,8 +95,9 @@ def build_recommendations(
         recommendations.append("Reduce operating speed")
     if fuel_consumption is not None and fuel_consumption > 45.0:
         recommendations.append("Reduce operating depth")
-    if draft_force is not None and power_utilization is not None and power_utilization > 85.0:
-        recommendations.append("Use a narrower or lighter implement")
+    # NOTE: no fifth rule here. An earlier `power_utilization > 85` ->
+    # "Use a narrower or lighter implement" rule had no counterpart in either
+    # reference implementation, and overlapped the >90% rule above.
 
     deduped: list[str] = []
     for item in recommendations:

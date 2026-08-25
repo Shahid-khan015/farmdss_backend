@@ -34,7 +34,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.core.constants import (
-    FRONT_BALLAST_TARGET_KWEF,
     GRAVITY,
     KI_RANGE,
     ROTOR_EFFICIENCY_RANGE,
@@ -49,6 +48,9 @@ from app.core.dss_shared import (
     safe_div,
 )
 from app.core.legacy_algorithms import (
+    draft_width_parameter,
+    gross_traction_at_slip,
+    resolve_axle_loads,
     SlipSolution,
     _engine_torque_warnings,
     engine_torque_limited_pull_n,
@@ -145,6 +147,12 @@ class PassiveToolInputs:
     asae_param_a: float
     asae_param_b: float
     asae_param_c: float
+    #: Number of ground-engaging tools -- Eq. 3.1's `W` for per-tool implement
+    #: classes (see `constants.DRAFT_WIDTH_IS_TOOL_COUNT`); ignored for the rest.
+    number_of_tools: Optional[int] = None
+    #: Py/D for this tool. Both reference implementations carry the ratio per
+    #: implement rather than per type; None falls back to the type table.
+    vertical_horizontal_ratio: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -319,7 +327,9 @@ def _draft_for_tool(tool: PassiveToolInputs, *, soil_texture: SoilTexture, speed
         asae_param_b=tool.asae_param_b,
         asae_param_c=tool.asae_param_c,
         speed_kmh=speed_kmh,
-        width_m=tool.width_m,
+        width_m=draft_width_parameter(
+            tool.implement_type, tool.width_m, tool.number_of_tools
+        ),
         depth_cm=depth_cm,
     )
 
@@ -365,7 +375,10 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
     wi_n = w1_n + w2_n
     # Combined vertical soil reaction: each tool's own Py/D ratio applied to its
     # own draft, then summed (see module docstring).
-    py_n = py_over_d_ratio(t1.implement_type) * d1 + py_over_d_ratio(t2.implement_type) * d2
+    py_n = (
+        py_over_d_ratio(t1.implement_type, t1.vertical_horizontal_ratio) * d1
+        + py_over_d_ratio(t2.implement_type, t2.vertical_horizontal_ratio) * d2
+    )
     geometry = geometry_terms(
         depth_cm=inputs.depth_cm,
         rear_rolling_radius_m=inputs.rear_rolling_radius_m,
@@ -378,23 +391,33 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
     moment_terms = w1_n * t1.cg_distance_from_hitch_m + w2_n * t2.cg_distance_from_hitch_m
     xcgi_eff = moment_terms / wi_n if wi_n > 0 else 0.0
 
-    rd_n, fd_n = _combined_axle_load_shared(
-        tractor_weight_n=tractor_weight_n,
-        cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
-        combined_cg_from_hitch_m=xcgi_eff,
-        py_n=py_n,
-        hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
-        draft_n=d_total,
-        yd_m=yd_m,
-        er_m=er_m,
-        ef_m=ef_m,
-        wheelbase_m=inputs.wheelbase_m,
-        total_implement_weight_n=wi_n,
-    )
-    if rd_n <= 0 or fd_n <= 0:
-        raise ValueError("Invalid load distribution: dynamic axle load became non-positive")
+    def _axle_loads_with_ballast(extra_n: float) -> "tuple[float, float]":
+        """Both axle loads with `extra_n` N of front ballast, same combined balance."""
+        return _combined_axle_load_shared(
+            tractor_weight_n=tractor_weight_n + extra_n,
+            cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
+            combined_cg_from_hitch_m=xcgi_eff,
+            py_n=py_n,
+            hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
+            draft_n=d_total,
+            yd_m=yd_m,
+            er_m=er_m,
+            ef_m=ef_m,
+            wheelbase_m=inputs.wheelbase_m,
+            total_implement_weight_n=wi_n,
+        )
+
+    rd_n, fd_n = _axle_loads_with_ballast(0.0)
 
     warnings: list[str] = []
+    axles = resolve_axle_loads(
+        rear_axle_load_n=rd_n,
+        front_axle_load_n=fd_n,
+        tractor_weight_n=tractor_weight_n,
+        axle_loads_for_added_weight=_axle_loads_with_ballast,
+        warnings=warnings,
+    )
+    rd_n, fd_n = axles.rear_axle_load_n, axles.front_axle_load_n
     # Driven-wheel numeric: the Section 3 `Bn = CI*b*d/Wd`, evaluated at this
     # combination's own rear axle load (W = Rr/2). The combination enters through
     # that load -- via DTotal -- not through a different wheel-numeric model.
@@ -426,7 +449,14 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
             )
 
     te_pct = clamp(
-        traction_efficiency_percent(slip_solution.mu, slip_solution.mu_g, slip / 100.0), 0.0, 100.0
+        traction_efficiency_percent(
+            slip_solution.mu,
+            slip_solution.mu_g,
+            slip / 100.0,
+            bn_rear=slip_solution.bn_rear,
+        ),
+        0.0,
+        100.0,
     )
     if te_pct <= 0:
         raise ValueError("Either decrease depth or speed of operation, since slip is very low")
@@ -473,23 +503,23 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
     )
     pdb_kw, ptr_kw, pused_pct = power.pdb_kw, power.ptr_kw, power.put_pct
 
-    # Ballast equations are reused verbatim from Section 3 (per the document's own
-    # note); Xcgi is the weight-weighted combined CG (see module docstring).
-    xcgi_eff = moment_terms / wi_n if wi_n > 0 else 0.0
-
+    # Ballast uses the same two solvers as every other mode; the front one is fed
+    # this combination's own Eq. 3.5 balance, re-solved with the trial ballast.
     ballast_front_kg, front_ballast_feasible = front_ballast_required_kg(
-        kwef=kwf,
         tractor_weight_n=tractor_weight_n,
-        rsf_n=inputs.front_axle_weight_kg * GRAVITY,
-        draft_n=d_total,
-        yd_m=yd_m,
-        implement_weight_n=wi_n,
-        py_n=py_n,
-        cg_distance_from_hitch_m=xcgi_eff,
-        hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
-        er_m=er_m,
-        ef_m=ef_m,
-        wheelbase_m=inputs.wheelbase_m,
+        rf_for_added_weight_n=lambda extra_n: _combined_axle_load_shared(
+            tractor_weight_n=tractor_weight_n + extra_n,
+            cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
+            combined_cg_from_hitch_m=xcgi_eff,
+            py_n=py_n,
+            hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
+            draft_n=d_total,
+            yd_m=yd_m,
+            er_m=er_m,
+            ef_m=ef_m,
+            wheelbase_m=inputs.wheelbase_m,
+            total_implement_weight_n=wi_n,
+        )[1],
     )
     if not front_ballast_feasible:
         warnings.append(
@@ -497,27 +527,15 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
             "amount of front ballast for this tractor/implement combination."
         )
 
-    ballast_rear_kg = rear_ballast_required_kg(
-        slip_pct=slip,
+    ballast_rear_kg, rear_ballast_problem = rear_ballast_required_kg(
         draft_n=d_total,
         rear_axle_load_n=rd_n,
-        rsr_n=inputs.rear_axle_weight_kg * GRAVITY,
         ci_kpa=inputs.cone_index_kpa,
         rear_section_width_m=inputs.rear_section_width_m,
         rear_overall_diameter_m=inputs.rear_overall_diameter_m,
-        yd_m=yd_m,
-        implement_weight_n=wi_n,
-        py_n=py_n,
-        cg_distance_from_hitch_m=xcgi_eff,
-        hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
-        tractor_weight_n=tractor_weight_n,
-        er_m=er_m,
-        ef_m=ef_m,
-        wheelbase_m=inputs.wheelbase_m,
-        # The wheel numeric is re-evaluated at the trial rear load (W = R'/2) on
-        # every fixed-point iteration, using the same Section 3 `Bn` as the slip
-        # solve above so the two stay on one model.
     )
+    if rear_ballast_problem:
+        warnings.append(rear_ballast_problem)
 
     sfc = power.sfc
     fuel_cons_l_per_ha = power.fuel_l_per_ha
@@ -569,6 +587,10 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
         "confidence": confidence,
         "recommendation_messages": envelope.recommendation_messages,
         "converged": slip_solution.converged,
+        # Front ballast fitted to keep a front-lifting combination answerable;
+        # non-zero means the figures above are conditional on carrying it.
+        "stabilising_front_ballast_kg": axles.stabilising_ballast_kg,
+        "infeasible_without_ballast": axles.infeasible_without_ballast,
         "engine_torque_limited_pull": pet_n,
         "fuel_l_per_hour": power.fuel_lph,
         "fuel_l_per_hour_pto_basis": power.fuel_lph_pto_basis,
@@ -578,6 +600,17 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
         "legacy_mobility_number_rear": slip_solution.bn_rear,
         "legacy_mobility_number_front": bnf,
         "legacy_gross_traction_ratio": slip_solution.mu_g,
+        # Gross traction ratio developed AT the operating slip -- the denominator
+        # Eq. 3.2 actually calls for. Reported so the TE figure is checkable.
+        "gross_traction_at_slip": gross_traction_at_slip(slip_solution.bn_rear, slip / 100.0, mu_g=slip_solution.mu_g),
+        # TE computed the way both reference implementations do it, dividing by the
+        # Brixius envelope instead. Diagnostic ONLY -- it is the known-incorrect
+        # form (see SIMULATION_ENGINE_FORMULAS.md A9) and drives nothing. Present
+        # so a number-for-number comparison against those references is explainable
+        # without re-deriving it by hand.
+        "traction_efficiency_reference_basis": (
+            slip_solution.mu * (1.0 - slip / 100.0) / slip_solution.mu_g * 100.0 if slip_solution.mu_g else 0.0
+        ),
         "motion_resistance_ratio": mr_ratio,
         "motion_resistance": mr_ratio,
         # Audit trail only: what the Section 4 expression would have produced at the
@@ -623,10 +656,16 @@ def effective_draft_n(*, passive_draft_n: float, rotor_mechanical_resistance_n: 
     if d_eff <= 0:
         raise ValueError(
             "Effective draft (Deff) is non-positive: the rotor's forward thrust "
-            "exceeds the combined resistance of the passive tool and the rotor's own "
-            "mechanical drag. This configuration would not require any drawbar pull "
-            "from the tractor -- reduce rotor PTO power/efficiency or increase "
-            "operating speed."
+            "({0:.0f} N) exceeds the passive tool's draft plus the rotor's own "
+            "mechanical drag ({1:.0f} N = {2:.0f} + {3:.0f}). The combination would "
+            "push the tractor rather than need pull from it, so the traction model "
+            "does not apply. Reduce the rotor's PTO power draw or efficiency, raise "
+            "the operating speed, or pair the rotor with a heavier-draft tool.".format(
+                thrust_n,
+                passive_draft_n + rotor_mechanical_resistance_n,
+                passive_draft_n,
+                rotor_mechanical_resistance_n,
+            )
         )
     return d_eff
 
@@ -698,7 +737,7 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
     tractor_weight_n = (inputs.front_axle_weight_kg + inputs.rear_axle_weight_kg) * GRAVITY
     wp_n = passive.weight_kg * GRAVITY
     wa_n = rotor.weight_kg * GRAVITY
-    py_n = py_over_d_ratio(passive.implement_type) * dp
+    py_n = py_over_d_ratio(passive.implement_type, passive.vertical_horizontal_ratio) * dp
     geometry = geometry_terms(
         depth_cm=inputs.depth_cm,
         rear_rolling_radius_m=inputs.rear_rolling_radius_m,
@@ -712,24 +751,34 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
     moment_terms = wp_n * passive.cg_distance_from_hitch_m + wa_n * rotor.cg_distance_from_hitch_m
     xcgi_eff = moment_terms / wi_n if wi_n > 0 else 0.0
 
-    rd_n, fd_n = _combined_axle_load_shared(
-        tractor_weight_n=tractor_weight_n,
-        cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
-        combined_cg_from_hitch_m=xcgi_eff,
-        py_n=py_n,
-        hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
-        draft_n=d_eff,
-        yd_m=yd_m,
-        er_m=er_m,
-        ef_m=ef_m,
-        wheelbase_m=inputs.wheelbase_m,
-        total_implement_weight_n=wi_n,
-        extra_rear_load_n=weq_n + rotor.dynamic_vertical_force_n,  # DSS Eq. 5.6/5.7a
-    )
-    if rd_n <= 0 or fd_n <= 0:
-        raise ValueError("Invalid load distribution: dynamic axle load became non-positive")
+    def _axle_loads_with_ballast(extra_n: float) -> "tuple[float, float]":
+        """Both axle loads with `extra_n` N of front ballast, same combined balance."""
+        return _combined_axle_load_shared(
+            tractor_weight_n=tractor_weight_n + extra_n,
+            cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
+            combined_cg_from_hitch_m=xcgi_eff,
+            py_n=py_n,
+            hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
+            draft_n=d_eff,
+            yd_m=yd_m,
+            er_m=er_m,
+            ef_m=ef_m,
+            wheelbase_m=inputs.wheelbase_m,
+            total_implement_weight_n=wi_n,
+            extra_rear_load_n=weq_n + rotor.dynamic_vertical_force_n,  # DSS Eq. 5.6/5.7a
+        )
+
+    rd_n, fd_n = _axle_loads_with_ballast(0.0)
 
     warnings: list[str] = []
+    axles = resolve_axle_loads(
+        rear_axle_load_n=rd_n,
+        front_axle_load_n=fd_n,
+        tractor_weight_n=tractor_weight_n,
+        axle_loads_for_added_weight=_axle_loads_with_ballast,
+        warnings=warnings,
+    )
+    rd_n, fd_n = axles.rear_axle_load_n, axles.front_axle_load_n
     # Tractive performance uses only Deff -- the rotor's own thrust/torque terms
     # already left the traction sub-model via Deff and Rr (DSS Section 5.9).
     # Rear mobility number reuses the single-tool Bn (see the equivalent, more
@@ -749,7 +798,14 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
         warnings.append("Simulation retained bounded partial results from the last stable iteration.")
 
     te_pct = clamp(
-        traction_efficiency_percent(slip_solution.mu, slip_solution.mu_g, slip / 100.0), 0.0, 100.0
+        traction_efficiency_percent(
+            slip_solution.mu,
+            slip_solution.mu_g,
+            slip / 100.0,
+            bn_rear=slip_solution.bn_rear,
+        ),
+        0.0,
+        100.0,
     )
     if te_pct <= 0:
         raise ValueError("Either decrease depth or speed of operation, since slip is very low")
@@ -796,26 +852,47 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
     pdb_kw, ptr_kw, pused_pct = power.pdb_kw, power.ptr_kw, power.put_pct
     x_eff = power.x_fraction
 
-    # Front ballast: DSS Eq. 5.10/5.11 -- a closed form specific to the
-    # active-passive case (ballast adds directly to Rf here, unlike the
-    # implicit Eq. 3.7 reused for the single/passive-passive cases).
-    #   Rf = 0.20*(Wt + BRf)  =>  BRf = (0.20*Wt - Rf) / 0.80
-    ballast_front_kg = 0.0
-    if kwf < FRONT_BALLAST_TARGET_KWEF:
-        br_f_n = safe_div(
-            "active-passive front ballast",
-            FRONT_BALLAST_TARGET_KWEF * tractor_weight_n - fd_n,
-            1.0 - FRONT_BALLAST_TARGET_KWEF,
+    # Ballast uses the same two shared solvers as the other modes. DSS Eq. 5.12/5.13
+    # (Rreq = Deff/mu(S), BRr = Rreq - Rr) is exactly what `rear_ballast_required_kg`
+    # now computes, differing only in the target slip -- Section 5 sizes at the
+    # *solved* slip rather than the 15% target, which the reference implementation
+    # also does -- so it is passed as `target_slip_fraction` instead of being
+    # re-implemented here. Eq. 5.10/5.11's closed form is likewise subsumed by the
+    # shared front solver, which re-solves this mode's own axle balance.
+    ballast_front_kg, front_ballast_feasible = front_ballast_required_kg(
+        tractor_weight_n=tractor_weight_n,
+        rf_for_added_weight_n=lambda extra_n: _combined_axle_load_shared(
+            tractor_weight_n=tractor_weight_n + extra_n,
+            cg_distance_from_rear_m=inputs.cg_distance_from_rear_m,
+            combined_cg_from_hitch_m=xcgi_eff,
+            py_n=py_n,
+            hitch_distance_from_rear_m=inputs.hitch_distance_from_rear_m,
+            draft_n=d_eff,
+            yd_m=yd_m,
+            er_m=er_m,
+            ef_m=ef_m,
+            wheelbase_m=inputs.wheelbase_m,
+            total_implement_weight_n=wi_n,
+            extra_rear_load_n=weq_n + rotor.dynamic_vertical_force_n,
+        )[1],
+    )
+    if not front_ballast_feasible:
+        warnings.append(
+            "Front-axle weight-utilization target (Kwef=0.20) cannot be reached with any "
+            "amount of front ballast for this tractor/implement combination."
         )
-        ballast_front_kg = max(0.0, br_f_n) / GRAVITY
 
-    # Rear ballast: DSS Eq. 5.12/5.13 -- Rreq = Deff/mu(S), BRr = Rreq - Rr. A
-    # negative BRr (rotor thrust/reaction already supplies enough rear loading)
-    # is reported as 0 with a note, per the document's own commentary.
-    r_req_n = d_eff / slip_solution.mu if slip_solution.mu > 0 else float("inf")
-    br_r_raw_n = r_req_n - rd_n
-    ballast_rear_kg = max(0.0, br_r_raw_n) / GRAVITY
-    if br_r_raw_n <= 0:
+    ballast_rear_kg, rear_ballast_problem = rear_ballast_required_kg(
+        draft_n=d_eff,
+        rear_axle_load_n=rd_n,
+        ci_kpa=inputs.cone_index_kpa,
+        rear_section_width_m=inputs.rear_section_width_m,
+        rear_overall_diameter_m=inputs.rear_overall_diameter_m,
+        target_slip_fraction=slip / 100.0,
+    )
+    if rear_ballast_problem:
+        warnings.append(rear_ballast_problem)
+    elif ballast_rear_kg == 0.0:
         warnings.append(
             "Rear ballast is not required: the active rotor's thrust and PTO reaction "
             "moment already supply sufficient rear-axle loading."
@@ -875,6 +952,10 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
         "confidence": confidence,
         "recommendation_messages": envelope.recommendation_messages,
         "converged": slip_solution.converged,
+        # Front ballast fitted to keep a front-lifting combination answerable;
+        # non-zero means the figures above are conditional on carrying it.
+        "stabilising_front_ballast_kg": axles.stabilising_ballast_kg,
+        "infeasible_without_ballast": axles.infeasible_without_ballast,
         "engine_torque_limited_pull": pet_n,
         "pto_power_fraction_effective": x_eff,
         "fuel_l_per_hour": power.fuel_lph,
@@ -885,6 +966,17 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
         "legacy_mobility_number_rear": slip_solution.bn_rear,
         "legacy_mobility_number_front": bnf,
         "legacy_gross_traction_ratio": slip_solution.mu_g,
+        # Gross traction ratio developed AT the operating slip -- the denominator
+        # Eq. 3.2 actually calls for. Reported so the TE figure is checkable.
+        "gross_traction_at_slip": gross_traction_at_slip(slip_solution.bn_rear, slip / 100.0, mu_g=slip_solution.mu_g),
+        # TE computed the way both reference implementations do it, dividing by the
+        # Brixius envelope instead. Diagnostic ONLY -- it is the known-incorrect
+        # form (see SIMULATION_ENGINE_FORMULAS.md A9) and drives nothing. Present
+        # so a number-for-number comparison against those references is explainable
+        # without re-deriving it by hand.
+        "traction_efficiency_reference_basis": (
+            slip_solution.mu * (1.0 - slip / 100.0) / slip_solution.mu_g * 100.0 if slip_solution.mu_g else 0.0
+        ),
         "motion_resistance_ratio": mr_ratio,
         "motion_resistance": mr_ratio,
         "rotor_mechanical_power": rotor_power_kw,

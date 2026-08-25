@@ -9,10 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.constants import (
-    FI_FACTOR_BY_IMPLEMENT_AND_TEXTURE,
-    PY_OVER_D_RATIO_BY_IMPLEMENT,
-)
+from app.core.constants import PY_OVER_D_RATIO_BY_IMPLEMENT
 from app.core.implement_taxonomy import (
     ACTIVE_IMPLEMENT_TYPES,
     IMPLEMENT_POWER_CLASS,
@@ -37,7 +34,10 @@ from app.models.enums import (
 
 # --- Exhaustiveness guards --------------------------------------------------
 # These are the cheap permanent defence against adding an ImplementType member
-# without classifying it (or without giving a passive type its Fi / Py-D entry).
+# without classifying it (or without giving a passive type its Py-D entry).
+# Fi is no longer among them: it is keyed on soil texture alone, so there is no
+# per-implement entry left to omit. `fi_factor`'s own passive-only guard is
+# pinned by test_fi_factor_raises_value_error_for_active_types below.
 
 
 @pytest.mark.parametrize("implement_type", list(ImplementType))
@@ -55,10 +55,8 @@ def test_every_implement_type_has_a_tillage_stage_entry(implement_type):
 def test_passive_types_have_draft_table_entries_and_active_types_do_not(implement_type):
     """The DSS passive-draft model is defined only for unpowered tools."""
     if is_passive(implement_type):
-        assert implement_type.value in FI_FACTOR_BY_IMPLEMENT_AND_TEXTURE
         assert implement_type.value in PY_OVER_D_RATIO_BY_IMPLEMENT
     else:
-        assert implement_type.value not in FI_FACTOR_BY_IMPLEMENT_AND_TEXTURE
         assert implement_type.value not in PY_OVER_D_RATIO_BY_IMPLEMENT
 
 
@@ -111,13 +109,29 @@ def test_py_over_d_ratio_raises_value_error_for_active_types(active_type):
         py_over_d_ratio(active_type)
 
 
-def test_passive_lookups_are_unchanged():
-    """Legacy values must not drift -- these are DSS-exact."""
+def test_passive_lookups_match_the_reference_implementations():
+    """Fallback Py/D values, pinned to both reference implementations.
+
+    The spreadsheet's "Vertical to Horizontal force ratio" row and the HTML
+    library's `PyD` field agree exactly on these. They supersede an earlier table
+    (0.15 / 0.40 / 0.50 / 0.0) taken from the DSS document's Kepner citation,
+    which disagreed with both references on every row.
+    """
     assert fi_factor(ImplementType.MB_PLOUGH, SoilTexture.FINE) == 1.0
-    assert py_over_d_ratio(ImplementType.MB_PLOUGH) == 0.15
-    assert py_over_d_ratio(ImplementType.DISC_PLOUGH) == 0.40
-    assert py_over_d_ratio(ImplementType.DISC_HARROW) == 0.50
-    assert py_over_d_ratio(ImplementType.CULTIVATOR) == 0.0
+    assert py_over_d_ratio(ImplementType.MB_PLOUGH) == 0.20
+    assert py_over_d_ratio(ImplementType.DISC_PLOUGH) == 0.0
+    assert py_over_d_ratio(ImplementType.DISC_HARROW) == 0.0
+    assert py_over_d_ratio(ImplementType.CULTIVATOR) == 0.20
+
+
+def test_per_implement_ratio_overrides_the_type_table():
+    """Both references carry Py/D per implement; the table is only a fallback."""
+    assert py_over_d_ratio(ImplementType.MB_PLOUGH, 0.35) == 0.35
+    assert py_over_d_ratio(ImplementType.DISC_PLOUGH, 0.0) == 0.0
+    # None means "not recorded on this implement" -> fall back to the table.
+    assert py_over_d_ratio(ImplementType.MB_PLOUGH, None) == 0.20
+    with pytest.raises(ValueError):
+        py_over_d_ratio(ImplementType.MB_PLOUGH, -0.1)
 
 
 # --- Slot assignment rules --------------------------------------------------
