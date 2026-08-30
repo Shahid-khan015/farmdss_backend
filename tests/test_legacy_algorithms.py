@@ -32,6 +32,7 @@ from app.core.legacy_algorithms import (
     rolling_resistance_rear,
     solve_slip,
     specific_fuel_consumption_l_per_kwh,
+    traction_efficiency_at_slip_pct,
     traction_efficiency_percent,
 )
 from app.models.enums import ImplementType, SoilTexture
@@ -205,8 +206,8 @@ def test_traction_efficiency_formula():
     slip = 0.10
     mu = net_traction_coefficient(bn, slip)
     mu_g = gross_traction_ratio(bn)
-    # DSS Eq. 3.2: TE = mu*(1-S)/GT, GT taken AT the operating slip.
-    expected = (mu * (1.0 - slip) / gross_traction_at_slip(bn, slip)) * 100.0
+    # DSS spec Eq. (3.2): TE = mu*(1-S)/mu_g -- the Brixius ENVELOPE, no +0.04 term.
+    expected = (mu * (1.0 - slip) / mu_g) * 100.0
     assert traction_efficiency_percent(mu, mu_g, slip, bn_rear=bn) == pytest.approx(expected)
 
 
@@ -755,26 +756,42 @@ def test_net_traction_is_brixius_gross_minus_motion_resistance():
     assert net_traction_coefficient(bn, s, mu_g=mu_g) == pytest.approx(gt - mr)
 
 
-def test_tractive_efficiency_uses_gross_traction_at_slip_not_the_envelope():
+def test_tractive_efficiency_uses_the_envelope_per_spec_eq_3_2():
+    """DSS spec Eq. (3.2) divides by the envelope `mu_g`, not by GT at slip.
+
+    Eq. (3.2) lives in the DOCX as a MathType/OLE object (`word/media/image1.wmf`),
+    which is why text extraction shows only the label. Rendered, it reads
+    `TE = mu*(1-S)/mu_g`. `tillage_dss.html` and spreadsheet `C59` agree.
+
+    An earlier revision used `gross_traction_at_slip` here, on the argument that
+    field TE sits near 70-80% and the envelope gives ~45%. That made the engine the
+    only outlier against its own specification; the reading is now conformance, and
+    the at-slip value is kept as the `traction_efficiency_at_slip_percent`
+    diagnostic.
+    """
     bn, s = 48.7, 0.10
     mu_g = gross_traction_ratio(bn)
     mu = net_traction_coefficient(bn, s, mu_g=mu_g)
 
     te = traction_efficiency_percent(mu, mu_g, s, bn_rear=bn)
-    assert te == pytest.approx((mu / gross_traction_at_slip(bn, s)) * (1 - s) * 100.0)
+    assert te == pytest.approx((mu * (1 - s) / mu_g) * 100.0)
+    assert te == pytest.approx(44.6323, abs=1e-3)
+    assert te < 100.0
 
-    # Field-measured TE for an agricultural tyre sits near 70-80% at working
-    # slip. The old envelope denominator gave ~45% here, which is why it was wrong.
-    assert 70.0 < te < 80.0
-    assert (mu * (1 - s) / mu_g) * 100.0 < 50.0
-    assert traction_efficiency_percent(mu, mu_g, s, bn_rear=bn) < 100.0
+    # The at-slip form is still available, and still reads markedly higher.
+    at_slip = traction_efficiency_at_slip_pct(mu, mu_g, s, bn_rear=bn)
+    assert at_slip == pytest.approx(77.8326, abs=1e-3)
+    assert at_slip > te
 
 
-def test_tractive_efficiency_peaks_at_a_working_slip():
-    """TE must have an optimum -- a DSS that cannot find one cannot advise on slip.
+def test_envelope_te_is_monotonic_in_slip_so_no_optimum_exists():
+    """Accepted consequence of the specified model -- do not compensate for it.
 
-    With the envelope as denominator TE rises monotonically and no optimum
-    exists; with the correct GT it peaks in the 8-15% band.
+    With the envelope denominator, TE rises monotonically across the whole 1-25%
+    working band, so there is no interior optimum for a slip recommendation to aim
+    at. The at-slip form did peak in the 8-15% band. This test records the
+    behavioural difference so it cannot be reintroduced by accident, and so anyone
+    building slip advice knows the headline TE will not give them a turning point.
     """
     bn = 48.7
     mu_g = gross_traction_ratio(bn)
@@ -783,10 +800,16 @@ def test_tractive_efficiency_peaks_at_a_working_slip():
         mu = net_traction_coefficient(bn, slip_fraction, mu_g=mu_g)
         return traction_efficiency_percent(mu, mu_g, slip_fraction, bn_rear=bn)
 
+    def te_at_slip(slip_fraction: float) -> float:
+        mu = net_traction_coefficient(bn, slip_fraction, mu_g=mu_g)
+        return traction_efficiency_at_slip_pct(mu, mu_g, slip_fraction, bn_rear=bn)
+
     grid = [i / 1000.0 for i in range(10, 251)]  # 1% .. 25%
-    best = max(grid, key=te)
-    assert 0.08 <= best <= 0.15
-    assert te(best) > te(0.02) and te(best) > te(0.25)
+    assert all(te(grid[i + 1]) >= te(grid[i]) - 1e-12 for i in range(len(grid) - 1))
+    assert max(grid, key=te) == pytest.approx(0.25)
+
+    # The retained diagnostic still has its interior optimum.
+    assert 0.08 <= max(grid, key=te_at_slip) <= 0.15
 
 
 # --- Eq. 3.1 `W`: metres or tool count --------------------------------------
@@ -919,23 +942,29 @@ def test_resolve_axle_loads_passes_a_healthy_pair_through_untouched():
 # if any of them is changed silently.
 
 
-def test_reference_te_basis_is_reported_but_drives_nothing():
-    """The known-incorrect envelope-denominator TE is a diagnostic only."""
+def test_at_slip_te_is_reported_but_drives_nothing():
+    """The headline TE is the spec's envelope form; the at-slip form is diagnostic."""
     results = calculate_legacy_performance(make_inputs(depth_cm=10.0))
     bn = results["legacy_mobility_number_rear"]
     mu = results["coefficient_net_traction"]
     mu_g = results["legacy_gross_traction_ratio"]
     s = results["slip"] / 100.0
 
+    # Headline: DSS spec Eq. (3.2), divided by the envelope.
+    assert results["traction_efficiency"] == pytest.approx(mu * (1 - s) / mu_g * 100.0)
+    # Retained for compatibility; now the same quantity as the headline.
     assert results["traction_efficiency_reference_basis"] == pytest.approx(
-        mu * (1 - s) / mu_g * 100.0
+        results["traction_efficiency"]
     )
+
+    # Diagnostic: the former primary, and the ratio it is built from.
     assert results["gross_traction_at_slip"] == pytest.approx(gross_traction_at_slip(bn, s))
-    # The reported TE uses the correct denominator, and the power chain follows it.
-    assert results["traction_efficiency"] == pytest.approx(
+    assert results["traction_efficiency_at_slip_percent"] == pytest.approx(
         mu * (1 - s) / results["gross_traction_at_slip"] * 100.0
     )
-    assert results["traction_efficiency"] > results["traction_efficiency_reference_basis"]
+    assert results["traction_efficiency_at_slip_percent"] > results["traction_efficiency"]
+
+    # The power chain follows the headline, not the diagnostic.
     assert results["required_pto_power"] == pytest.approx(
         results["drawbar_power"] / (results["traction_efficiency"] / 100.0 * 0.86)
     )

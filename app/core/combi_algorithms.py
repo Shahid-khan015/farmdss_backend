@@ -59,6 +59,8 @@ from app.core.legacy_algorithms import (
     front_ballast_required_kg,
     rear_ballast_required_kg,
     solve_slip,
+    traction_efficiency_at_slip_pct,
+    traction_efficiency_envelope_percent,
     traction_efficiency_percent,
     wheel_response,
 )
@@ -595,6 +597,11 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
         "fuel_l_per_hour": power.fuel_lph,
         "fuel_l_per_hour_pto_basis": power.fuel_lph_pto_basis,
         "legacy_field_efficiency_raw": capacity.field_eff_raw_pct,
+        # Diagnostics only. The headland time actually used carries an undocumented
+        # factor of 2 that the spreadsheet's C71 does not have; both bases are
+        # reported so the unresolved discrepancy is visible. See A15.
+        "headland_turning_time_hours": capacity.total_turning_time_h,
+        "headland_turning_time_single_pass_basis_hours": capacity.turning_time_single_pass_basis_h,
         "legacy_front_axle_load_n": fd_n,
         "legacy_rear_axle_load_n": rd_n,
         "legacy_mobility_number_rear": slip_solution.bn_rear,
@@ -603,13 +610,19 @@ def calculate_passive_passive_performance(inputs: PassivePassiveInputs) -> dict:
         # Gross traction ratio developed AT the operating slip -- the denominator
         # Eq. 3.2 actually calls for. Reported so the TE figure is checkable.
         "gross_traction_at_slip": gross_traction_at_slip(slip_solution.bn_rear, slip / 100.0, mu_g=slip_solution.mu_g),
-        # TE computed the way both reference implementations do it, dividing by the
-        # Brixius envelope instead. Diagnostic ONLY -- it is the known-incorrect
-        # form (see SIMULATION_ENGINE_FORMULAS.md A9) and drives nothing. Present
-        # so a number-for-number comparison against those references is explainable
-        # without re-deriving it by hand.
-        "traction_efficiency_reference_basis": (
-            slip_solution.mu * (1.0 - slip / 100.0) / slip_solution.mu_g * 100.0 if slip_solution.mu_g else 0.0
+        # TE divided by the gross traction ratio developed AT the operating slip --
+        # the engine's former primary. Diagnostic ONLY; the specification's Eq. (3.2)
+        # divides by the envelope. See "RESOLVED: tractive-efficiency denominator".
+        "traction_efficiency_at_slip_percent": traction_efficiency_at_slip_pct(
+            slip_solution.mu,
+            slip_solution.mu_g,
+            slip / 100.0,
+            bn_rear=slip_solution.bn_rear,
+        ),
+        # Retained for compatibility: now identical to the headline
+        # `traction_efficiency`, since the envelope IS the specified basis.
+        "traction_efficiency_reference_basis": traction_efficiency_envelope_percent(
+            slip_solution.mu, slip_solution.mu_g, slip / 100.0
         ),
         "motion_resistance_ratio": mr_ratio,
         "motion_resistance": mr_ratio,
@@ -961,6 +974,11 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
         "fuel_l_per_hour": power.fuel_lph,
         "fuel_l_per_hour_pto_basis": power.fuel_lph_pto_basis,
         "legacy_field_efficiency_raw": capacity.field_eff_raw_pct,
+        # Diagnostics only. The headland time actually used carries an undocumented
+        # factor of 2 that the spreadsheet's C71 does not have; both bases are
+        # reported so the unresolved discrepancy is visible. See A15.
+        "headland_turning_time_hours": capacity.total_turning_time_h,
+        "headland_turning_time_single_pass_basis_hours": capacity.turning_time_single_pass_basis_h,
         "legacy_front_axle_load_n": fd_n,
         "legacy_rear_axle_load_n": rd_n,
         "legacy_mobility_number_rear": slip_solution.bn_rear,
@@ -969,13 +987,19 @@ def calculate_active_passive_performance(inputs: ActivePassiveInputs) -> dict:
         # Gross traction ratio developed AT the operating slip -- the denominator
         # Eq. 3.2 actually calls for. Reported so the TE figure is checkable.
         "gross_traction_at_slip": gross_traction_at_slip(slip_solution.bn_rear, slip / 100.0, mu_g=slip_solution.mu_g),
-        # TE computed the way both reference implementations do it, dividing by the
-        # Brixius envelope instead. Diagnostic ONLY -- it is the known-incorrect
-        # form (see SIMULATION_ENGINE_FORMULAS.md A9) and drives nothing. Present
-        # so a number-for-number comparison against those references is explainable
-        # without re-deriving it by hand.
-        "traction_efficiency_reference_basis": (
-            slip_solution.mu * (1.0 - slip / 100.0) / slip_solution.mu_g * 100.0 if slip_solution.mu_g else 0.0
+        # TE divided by the gross traction ratio developed AT the operating slip --
+        # the engine's former primary. Diagnostic ONLY; the specification's Eq. (3.2)
+        # divides by the envelope. See "RESOLVED: tractive-efficiency denominator".
+        "traction_efficiency_at_slip_percent": traction_efficiency_at_slip_pct(
+            slip_solution.mu,
+            slip_solution.mu_g,
+            slip / 100.0,
+            bn_rear=slip_solution.bn_rear,
+        ),
+        # Retained for compatibility: now identical to the headline
+        # `traction_efficiency`, since the envelope IS the specified basis.
+        "traction_efficiency_reference_basis": traction_efficiency_envelope_percent(
+            slip_solution.mu, slip_solution.mu_g, slip / 100.0
         ),
         "motion_resistance_ratio": mr_ratio,
         "motion_resistance": mr_ratio,

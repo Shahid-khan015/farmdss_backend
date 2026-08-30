@@ -194,6 +194,12 @@ class FieldCapacity:
     turning_time_s: float
     number_turns: int
     total_time_h: float
+    #: Headland turning time actually used, which carries an undocumented factor of 2.
+    total_turning_time_h: float = 0.0
+    #: The same quantity without that factor -- the spreadsheet's `C71` basis.
+    #: Reported so the unresolved discrepancy is visible rather than buried in a
+    #: multiplication; it feeds nothing. See `docs/SIMULATION_ENGINE_FORMULAS.md` A15.
+    turning_time_single_pass_basis_h: float = 0.0
 
 
 def field_capacity(
@@ -207,11 +213,20 @@ def field_capacity(
 
     FCth = S * W / 10, ha/h                                        [DSS-EXACT]
 
-    Everything below it -- turning time, number of turns, the derivation of
-    actual capacity from total operating time, and the 50-95% clamp on field
-    efficiency -- is [LEGACY]: it is absent from the DSS document and is
-    preserved unchanged from the pre-existing implementation rather than
-    invented or "corrected".
+    Turning time, the number of turns, the derivation of actual capacity from
+    total operating time and the 50-95% field-efficiency clamp are
+    [REFERENCE-ALIGNED]: all four are in the spreadsheet (`C67`, `C68`, `C72`,
+    `C73`). They were previously tagged [LEGACY]/"absent from the DSS document",
+    which was wrong -- the document omits them, but the reference stack does not.
+
+    **Unresolved discrepancy (turning-time factor of 2).** Total headland time is
+    computed as `turning_time_s * 2 * number_turns`. The spreadsheet has no such
+    factor (`C71 = (C68*C67)/3600`); `tillage_dss.html` has it, but that file is a
+    port of this engine and so is not independent corroboration. No source derives
+    the 2 either way. Current behaviour is preserved deliberately -- silently
+    dropping it would shift every actual-capacity and fuel-per-hectare figure -- and
+    `turning_time_single_pass_basis_h` reports the unfactored value alongside it so
+    the disagreement is visible. Needs a ruling from the DSS author.
 
     `field_eff_raw_pct` exposes the unclamped ratio, because the clamp can make
     the reported efficiency inconsistent with the reported capacities.
@@ -231,7 +246,8 @@ def field_capacity(
         *TURNING_TIME_CLAMP,
     )
     number_turns = max(0, int(round(field_width_m / width_m)))
-    total_turning_time_h = (turning_time_s * 2.0 * number_turns) / 3600.0
+    single_pass_turning_time_h = (turning_time_s * number_turns) / 3600.0
+    total_turning_time_h = single_pass_turning_time_h * 2.0
     theoretical_time_h = field_area_ha / fc_th
     total_time_h = total_turning_time_h + theoretical_time_h
     if total_time_h <= 0:
@@ -247,6 +263,8 @@ def field_capacity(
         turning_time_s=turning_time_s,
         number_turns=number_turns,
         total_time_h=total_time_h,
+        total_turning_time_h=total_turning_time_h,
+        turning_time_single_pass_basis_h=single_pass_turning_time_h,
     )
 
 
@@ -306,10 +324,14 @@ def power_and_fuel(
     exactly how the document derives Section 4 from Section 5 ("Section 4's
     equations are the special case of Section 5's obtained by setting PPTO = 0").
 
-    Fuel basis [DSS-AMBIGUOUS / LEGACY]: the document gives SFC in L/kW-h and
-    stops there -- it never converts to L/h or L/ha, so there is no DSS-intended
-    multiplicand to recover. `fuel_lph = SFC * DBp` is preserved from the
-    pre-existing implementation and drives every reported fuel figure.
+    Fuel basis [REFERENCE-CONFIRMED]: the DSS document gives SFC in L/kW-h and
+    stops there, which previously made this a documented ambiguity. It is settled
+    by the spreadsheet's own cell formula: `C65 = C64*C60`, i.e. literally
+    `SFC * DBp`. (Its *note* column reads "SFC * Rated PTO power * 0.88", which
+    contradicts the formula beside it -- the formula is authoritative; that note
+    is one of three stale ones in the workbook.) `fuel_lph = SFC * DBp` is
+    therefore the reference behaviour, not merely preserved legacy.
+
     `fuel_lph_pto_basis = SFC * (Ptr + PPTO)` -- the reading that is
     dimensionally consistent with X -- is computed alongside it as a diagnostic
     and deliberately feeds nothing.

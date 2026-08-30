@@ -32,13 +32,16 @@ ROLLING_RESISTANCE_BASE = 0.04  # [DSS-EXACT]
 ROLLING_RESISTANCE_SLIP_COEFF = 0.5  # [DSS-EXACT]
 TRACTION_MU_G_SCALE = 0.88  # [DSS-EXACT]
 TRACTION_BN_EXPONENT_COEFF = 0.1  # [DSS-EXACT]
-# [DSS-AMBIGUOUS -> IMPLEMENTATION-ASSUMPTION]
+# [REFERENCE-CONFIRMED] -- was DSS-AMBIGUOUS until the spreadsheet formulas were read.
 # The DSS document's Eq. 3.9 image literally shows exp(-0.3*S). Implemented
 # literally, mu stays near zero across the whole practical 2-20% slip range, so
 # the slip solver never converges for any realistic input -- in any of the three
-# modes. 7.5 is the standard Wismer-Luth/Brixius literature value and produces
-# physically realistic traction curves. Confirmed with the user as a corrected
-# transcription, not a literal DSS value. This is the single place it is defined.
+# modes. 7.5 is the standard Wismer-Luth/Brixius literature value.
+#
+# This is no longer an assumption: the spreadsheet's own cell formula uses 7.5
+# explicitly -- `C58 = C57*(1-EXP(-7.5*C55))-(1/C52)-(0.5*C55)/(SQRT(C52))` -- as
+# does `tillage_dss.html` (K.TRACTION_SLIP_EXPONENT_COEFF). The document's 0.3 is
+# a transcription error in the equation image. This is the single place it is defined.
 TRACTION_SLIP_EXPONENT_COEFF = 7.5
 
 # --- Ballast requirement targets (DSS spec) ---
@@ -127,13 +130,18 @@ PTO_POWER_MIN_KW = 5.0
 PUT_PROPERLY_LOADED_RANGE = (95.0, 100.0)
 
 # --- Field capacity / turning time ---
-# [LEGACY] Absent from the DSS document; preserved unchanged from the
-# pre-existing implementation. turning_time_s = 15.56 + 2.61*(W/S) - 1.41*S.
+# [REFERENCE-ALIGNED] -- was tagged LEGACY/"absent from the DSS document", which was
+# wrong. The turning-time expression is the spreadsheet's `C67 = 15.56 + 2.61*(C14/C18)
+# - 1.41*C18`, and the 50-95% field-efficiency clamp is its `C73 = MIN(MAX(...,50),95)`.
+# Both are reference-sourced, not inventions of the pre-existing implementation.
 TURNING_TIME_COEFF_CONST = 15.56
 TURNING_TIME_COEFF_WIDTH_OVER_SPEED = 2.61
 TURNING_TIME_COEFF_SPEED = 1.41
-TURNING_TIME_CLAMP = (8.0, 45.0)  # seconds
 FIELD_EFFICIENCY_CLAMP = (50.0, 95.0)  # percent
+
+# [LEGACY] These two clamps are genuinely engine-only: the spreadsheet applies
+# neither, and both originate in this implementation (mirrored by the HTML port).
+TURNING_TIME_CLAMP = (8.0, 45.0)  # seconds
 OVERALL_EFFICIENCY_CLAMP = (0.0, 100.0)
 # NOTE: there is deliberately no upper clamp on fuel per hectare. An earlier
 # FUEL_L_PER_HA_CLAMP = (0.0, 200.0) capped it, which neither reference does

@@ -414,27 +414,94 @@ def net_traction_coefficient(
 def traction_efficiency_percent(
     mu: float, mu_g: float, slip_fraction: float, *, bn_rear: float
 ) -> float:
-    """TE = mu*(1-S) / GT (DSS Eq. 3.2), as a percentage.
+    """TE = mu*(1-S) / mu_g -- **DSS specification Eq. (3.2)**, as a percentage.
 
-    Eq. 3.2's denominator is the gross traction ratio *developed at the operating
-    slip* (`gross_traction_at_slip`), not the Brixius envelope `mu_g`.
-    Substituting the envelope understates TE by roughly 3x at working slips (26%
-    where the correct value is 75%), makes TE monotonic in slip so no optimum
-    exists, and -- because `Ptr = DBp/(TE*eta_t)` -- inflates power utilisation
-    by the same factor, which is the DSS's headline Overloaded/Underloaded
-    verdict.
+    The denominator is the Brixius **envelope** gross traction ratio
+    `mu_g = 0.88*(1 - exp(-0.1*Bn))`, the same quantity the document uses
+    everywhere else. There is no `+0.04` term and no slip factor in it.
 
-    `bn_rear` is keyword-only and REQUIRED on purpose: the original bug was that
-    the denominator could be supplied as the envelope without anything
-    complaining. Callers must now be explicit about which Bn the slip-dependent
-    denominator is built from.
+    **Provenance.** Eq. (3.2) is stored in the specification as a MathType/OLE
+    object (`word/media/image1.wmf`), which is why plain-text extraction of the
+    DOCX shows only the label "(3.2)" and its variable legend. Rendered, it reads
+    `TE = mu*(1-S)/mu_g`, with the document's own legend giving `mu` as the
+    coefficient of traction and `mu_g` as the gross traction ratio. All three
+    reference artifacts agree:
+
+    | source | denominator |
+    |---|---|
+    | DOCX Eq. (3.2) -- the specification | `mu_g` (envelope) |
+    | `tillage_dss.html` `tractiveEfficiencyPct` | `mu_g` (envelope) |
+    | spreadsheet `C59 = (C58*(1-C55))/C57` | `mu_g` (envelope) |
+
+    An earlier revision of this engine divided by the gross traction ratio
+    *developed at the operating slip* (`gross_traction_at_slip`), on the physical
+    argument that Eq. 3.2's denominator ought to be the ratio actually developed
+    rather than its asymptotic ceiling. That made the engine the sole outlier
+    against its own specification, and it has been reverted.
+
+    **Accepted, documented consequence:** the envelope reads TE *lower* -- and
+    therefore `Ptr = DBp/(TE*eta_t)` and power utilisation *higher* -- than the
+    at-slip form, most markedly at high mobility numbers (firm soil). That is a
+    property of the model the specification prescribes, not a defect here, and it
+    is deliberately not compensated for anywhere downstream.
+
+    The at-slip value is retained as the diagnostic
+    `traction_efficiency_at_slip_percent` (see `traction_efficiency_at_slip_pct`),
+    alongside the `gross_traction_at_slip` ratio it is built from, so the two
+    readings stay comparable. See "RESOLVED: tractive-efficiency denominator" in
+    docs/SIMULATION_ENGINE_FORMULAS.md.
+
+    `bn_rear` is keyword-only and retained: three call sites pass it, and it
+    records which wheel numeric the traction solution came from. The envelope
+    denominator does not consume it, so it is asserted rather than silently unused.
     """
     if mu_g == 0:
         raise ValueError("Gross traction ratio is zero")
+    require_positive("rear wheel numeric", bn_rear)
+    return traction_efficiency_envelope_percent(mu, mu_g, slip_fraction)
+
+
+def traction_efficiency_envelope_percent(
+    mu: float, mu_g: float, slip_fraction: float
+) -> float:
+    """`TE = mu*(1-S)/mu_g` as a percentage -- the specification's Eq. (3.2) form.
+
+    This is the **primary** TE basis; `traction_efficiency_percent` delegates here.
+    It is kept as a separate entry point because it is also what reconciles a run
+    against `tillage_dss.html` and the spreadsheet without re-deriving anything.
+
+    Returns 0.0 for a zero envelope rather than raising, so it stays safe to call
+    from a diagnostic context. `traction_efficiency_percent` applies the raising
+    guard before delegating, so the primary path still fails loudly.
+    """
+    if not mu_g:
+        return 0.0
+    return mu * (1.0 - slip_fraction) / mu_g * 100.0
+
+
+def traction_efficiency_at_slip_pct(
+    mu: float, mu_g: float, slip_fraction: float, *, bn_rear: float
+) -> float:
+    """TE divided by the gross traction ratio developed **at the operating slip**.
+
+    `TE_at_slip = mu*(1-S) / (mu_g*(1 - exp(-7.5*S)) + 0.04) * 100`
+
+    **Diagnostic only -- drives nothing.** This was the engine's primary until the
+    specification's Eq. (3.2) image was read (see `traction_efficiency_percent`);
+    it is retained because it is the physically-argued alternative and because
+    keeping it reported makes the difference between the two readings measurable
+    rather than a matter of recollection. Reported as
+    `traction_efficiency_at_slip_percent`.
+
+    Returns 0.0 rather than raising on a non-positive denominator, for the same
+    reason the envelope helper does.
+    """
+    if not mu_g:
+        return 0.0
     denominator = gross_traction_at_slip(bn_rear, slip_fraction, mu_g=mu_g)
     if denominator <= 0:
-        raise ValueError("Gross traction ratio at the operating slip is non-positive")
-    return (mu * (1.0 - slip_fraction) / denominator) * 100.0
+        return 0.0
+    return mu * (1.0 - slip_fraction) / denominator * 100.0
 
 
 @dataclass(frozen=True)
@@ -639,6 +706,14 @@ def front_ballast_required_kg(
     Supersedes a transcription of DSS Eq. 3.7, an implicit form whose right-hand
     side saturates below the ever-growing target for some geometries, making the
     target unreachable as an artefact of the equation rather than the physics.
+
+    **Kwef denominator -- reference conflict, resolved to `Wt`.** The spreadsheet
+    disagrees with itself here: cell `C77`'s formula is `Rf/(Rr+Rf)` (the *total*
+    dynamic weight) while its own note column beside it reads `Rf / Wt`. The
+    document's `image21` and `tillage_dss.html` both give `Rf/Wt`, which is what is
+    implemented. The choice is not cosmetic -- on the reference case it is 0.2087
+    (>= the 0.20 target, so no ballast) against 0.1672 (below target, ballast
+    demanded). See `docs/SIMULATION_ENGINE_FORMULAS.md` A11.
     """
     require_positive("tractor weight", tractor_weight_n)
 
@@ -1055,6 +1130,11 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         "fuel_l_per_hour": power.fuel_lph,
         "fuel_l_per_hour_pto_basis": power.fuel_lph_pto_basis,
         "legacy_field_efficiency_raw": capacity.field_eff_raw_pct,
+        # Diagnostics only. The headland time actually used carries an undocumented
+        # factor of 2 that the spreadsheet's C71 does not have; both bases are
+        # reported so the unresolved discrepancy is visible. See A15.
+        "headland_turning_time_hours": capacity.total_turning_time_h,
+        "headland_turning_time_single_pass_basis_hours": capacity.turning_time_single_pass_basis_h,
         "legacy_fi": fi,
         "legacypy_over_d_ratio": py_over_d,
         "legacy_turning_time_seconds": turning_time_s,
@@ -1067,13 +1147,16 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         # Gross traction ratio developed AT the operating slip -- the denominator
         # Eq. 3.2 actually calls for. Reported so the TE figure is checkable.
         "gross_traction_at_slip": gross_traction_at_slip(bnr, slip / 100.0, mu_g=mu_g),
-        # TE computed the way both reference implementations do it, dividing by the
-        # Brixius envelope instead. Diagnostic ONLY -- it is the known-incorrect
-        # form (see SIMULATION_ENGINE_FORMULAS.md A9) and drives nothing. Present
-        # so a number-for-number comparison against those references is explainable
-        # without re-deriving it by hand.
-        "traction_efficiency_reference_basis": (
-            mu * (1.0 - slip / 100.0) / mu_g * 100.0 if mu_g else 0.0
+        # TE divided by the gross traction ratio developed AT the operating slip --
+        # the engine's former primary. Diagnostic ONLY; the specification's Eq. (3.2)
+        # divides by the envelope. See "RESOLVED: tractive-efficiency denominator".
+        "traction_efficiency_at_slip_percent": traction_efficiency_at_slip_pct(
+            mu, mu_g, slip / 100.0, bn_rear=bnr
+        ),
+        # Retained for compatibility: now identical to the headline
+        # `traction_efficiency`, since the envelope IS the specified basis.
+        "traction_efficiency_reference_basis": traction_efficiency_envelope_percent(
+            mu, mu_g, slip / 100.0
         ),
         "slip_stepped": slip_solution.stepped_slip_pct,
         # Front ballast fitted to keep a front-lifting combination answerable.

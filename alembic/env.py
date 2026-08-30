@@ -13,7 +13,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.config import settings
-from app.database import Base
+from app.database import Base, normalize_database_url
 from app import models  # noqa: F401  (import models to register metadata)
 
 # this is the Alembic Config object, which provides
@@ -24,8 +24,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Set sqlalchemy.url from environment settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
+# Set sqlalchemy.url from environment settings. Normalized the same way the app does it, so a
+# hosted `postgres://` URL (no such dialect in SQLAlchemy 2) doesn't fail the build-time migration
+# even though the app itself would start fine.
+config.set_main_option(
+    "sqlalchemy.url", normalize_database_url(settings.DATABASE_URL).replace("%", "%%")
+)
 
 target_metadata = Base.metadata
 

@@ -12,6 +12,7 @@ from app.api.deps import get_db
 from app.models.iot_reading import IoTReading
 from app.schemas.iot import IotHistoryItem, IotHistoryResponse, IotLatestResponse, LatestFeedReading
 from app.services.alert_engine import get_status_label
+from app.services.iot_live import ensure_fresh
 from app.services.iot_query import get_history, get_latest_per_feed
 from app.services.normalizer import FEED_UNITS, FEEDS
 
@@ -48,6 +49,9 @@ def iot_latest(
     device_id: str = Query(default="default"),
     db: Session = Depends(get_db),
 ):
+    # Pull from Adafruit inline when what we hold is stale, so the first request after the
+    # service wakes from an idle spin-down still answers with live values. Fails open.
+    ensure_fresh(db, device_id, reason="iot_latest")
     latest = get_latest_per_feed(db, device_id=device_id)
     feeds = [_to_latest_item(fk, latest[fk]) for fk in FEEDS]
     return IotLatestResponse(device_id=device_id, feeds=feeds)

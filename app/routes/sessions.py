@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import uuid
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -32,6 +33,16 @@ from app.schemas.session import (
 router = APIRouter(prefix="/api/v1/sessions", tags=["Sessions"])
 alerts_router = APIRouter(prefix="/api/v1/alerts", tags=["Sessions"])
 GPS_FEED_KEYS = ("position_tracking", "gpsloc")
+
+logger = logging.getLogger(__name__)
+
+
+def _warm_iot_for_session(session_id: str) -> None:
+    """Background task: seed a freshly started session with current telemetry."""
+    from app.services.iot_live import refresh_now
+
+    stored = refresh_now(reason="session_start:{}".format(session_id))
+    logger.info("Session %s warm-up stored %s reading(s)", session_id, stored)
 
 
 def _assert_session_access(session: OperationSession, user: User, db: Session) -> None:
@@ -115,6 +126,7 @@ def _extract_lat_lon(raw_value: str) -> tuple[Optional[float], Optional[float]]:
 @router.post("/start", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
 def start_session(
     body: SessionStartRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_role(["operator"])),
     db: Session = Depends(get_db),
 ):
@@ -225,6 +237,10 @@ def start_session(
 
     db.commit()
     db.refresh(session)
+
+    # Pull telemetry immediately so the Active Session screen has live values on its first render
+    # rather than waiting out a poll interval. Runs after the response; failures are logged only.
+    background_tasks.add_task(_warm_iot_for_session, str(session.id))
     return _to_session_response(session)
 
 
