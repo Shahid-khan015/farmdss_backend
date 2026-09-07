@@ -33,6 +33,11 @@ class SimulationRunRequest(BaseModel):
     combination_type: SimulationCombinationType = SimulationCombinationType.SINGLE
     implement_2_id: Optional[uuid.UUID] = None
     interaction_coefficient: Optional[Decimal] = Field(default=None, ge=0, le=0.25)
+    #: Passive-passive field-capacity swath width, m. Optional; when omitted
+    #: (the default) the engine uses max(width_1, width_2), matching both
+    #: reference HTML tools' own default. Only meaningful for
+    #: combination_type=passive_passive.
+    effective_width_override_m: Optional[Decimal] = Field(default=None, gt=0)
 
     rotor_weight: Optional[Decimal] = Field(default=None, gt=0)
     rotor_cg_distance_from_hitch: Optional[Decimal] = Field(default=None, ge=0)
@@ -117,6 +122,7 @@ class SimulationRead(UUIDResponse, Timestamped, BaseModel):
     combination_type: SimulationCombinationType = SimulationCombinationType.SINGLE
     implement_2_id: Optional[uuid.UUID] = None
     interaction_coefficient: Optional[Decimal] = None
+    effective_width_override_m: Optional[Decimal] = None
     rotor_weight: Optional[Decimal] = None
     rotor_cg_distance_from_hitch: Optional[Decimal] = None
     rotor_mechanical_resistance: Optional[Decimal] = None

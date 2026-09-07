@@ -48,7 +48,13 @@ from app.core.legacy_algorithms import (
 )
 
 from test_combi_algorithms import make_ap_inputs, make_pp_inputs, make_rotor
-from test_reference_case_validation import _reference_inputs
+from test_reference_case_validation import (
+    POWER_RESERVE_PCT,
+    PTO_POWER_KW,
+    SPEED_KMH,
+    TRANS_EFF_PCT,
+    _reference_inputs,
+)
 
 BN_GRID = (5.0, 8.0, 15.0, 25.0, 40.0)
 SLIP_GRID = (0.02, 0.06, 0.10, 0.15, 0.20)
@@ -297,3 +303,64 @@ def test_fuel_per_hectare_has_no_upper_clamp():
     from app.core import constants
 
     assert not hasattr(constants, "FUEL_L_PER_HA_CLAMP")
+
+
+# --- Cross-engine parity against engine.py / tillage_dss_multiuser.html --------
+#
+# The newer reference line changed the fuel basis to PTO power. Before that change
+# our engine matched it on every stage except fuel, which differed by exactly
+# 1/(TE x eta_t). These pin the whole chain, fuel included.
+
+
+def _reference_engine_chain(bn, slip_frac, draft_n, speed_kmh, pto_kw, trans_eff_pct,
+                            reserve_pct, fc_ac):
+    """`engine.py`'s power_and_fuel, transcribed."""
+    mu_g = _html_mu_g(bn)
+    mu = _html_mu(bn, slip_frac)
+    te_pct = (mu * (1 - slip_frac) / mu_g) * 100.0
+    pdb_kw = draft_n * speed_kmh / 3.6 / 1000.0
+    ptr_kw = pdb_kw / ((te_pct / 100.0) * (trans_eff_pct / 100.0))
+    x = ptr_kw / pto_kw
+    sfc = (2.64 * x + 3.91) - 0.203 * math.sqrt(738 * x + 173)
+    return {
+        "te_pct": te_pct,
+        "pdb_kw": pdb_kw,
+        "ptr_kw": ptr_kw,
+        "put_pct": ptr_kw / (pto_kw * (1 - reserve_pct / 100.0)) * 100.0,
+        "sfc": sfc,
+        "fuel_lph": sfc * ptr_kw,          # PTO basis -- the reference's primary
+        "fuel_lha": sfc * ptr_kw / fc_ac,
+    }
+
+
+def test_every_stage_except_fuel_matches_the_reference_engine():
+    """Draft, slip, TE and the whole power chain agree with `engine.py` /
+    `tillage_dss_multiuser.html` to 1e-9. Fuel is the one deliberate exception:
+    production reverted to the drawbar-power basis to match a *different*, older
+    reference (`docs/tillage_dss (2).html`) exactly, so it now differs from this
+    reference (which is PTO-basis) by precisely the traction loss -- pinned below
+    via the `fuel_l_per_hour_pto_basis` diagnostic rather than the primary figure.
+    """
+    r = calculate_legacy_performance(_reference_inputs())
+    ref = _reference_engine_chain(
+        bn=r["legacy_mobility_number_rear"],
+        slip_frac=r["slip"] / 100.0,
+        draft_n=r["draft_force"],
+        speed_kmh=SPEED_KMH,
+        pto_kw=PTO_POWER_KW,
+        trans_eff_pct=TRANS_EFF_PCT,
+        reserve_pct=POWER_RESERVE_PCT,
+        fc_ac=r["field_capacity_actual"],
+    )
+    assert r["traction_efficiency"] == pytest.approx(ref["te_pct"], rel=1e-9)
+    assert r["drawbar_power"] == pytest.approx(ref["pdb_kw"], rel=1e-9)
+    assert r["required_pto_power"] == pytest.approx(ref["ptr_kw"], rel=1e-9)
+    assert r["power_utilization"] == pytest.approx(ref["put_pct"], rel=1e-9)
+    assert r["specific_fuel_consumption"] == pytest.approx(ref["sfc"], rel=1e-9)
+    # Fuel: the PTO-basis diagnostic matches this reference; the primary (drawbar)
+    # figure deliberately does not, by exactly the traction-loss ratio.
+    assert r["fuel_l_per_hour_pto_basis"] == pytest.approx(ref["fuel_lph"], rel=1e-9)
+    assert r["fuel_l_per_hour"] != pytest.approx(ref["fuel_lph"])
+    assert r["fuel_l_per_hour_pto_basis"] / r["fuel_l_per_hour"] == pytest.approx(
+        1.0 / (r["traction_efficiency"] / 100.0 * TRANS_EFF_PCT / 100.0), rel=1e-9
+    )

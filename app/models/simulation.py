@@ -64,6 +64,9 @@ class Simulation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         index=True,
     )
     interaction_coefficient: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # ki, 0.00-0.25
+    #: Field-capacity swath width override, m. None (the default) preserves the
+    #: engine's own max(width_1, width_2) -- see combi_algorithms.py.
+    effective_width_override_m: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)
 
     # --- Active-passive combination (DSS Section 5): PTO-driven rotor specs ---
     rotor_weight: Mapped[Optional[Decimal]] = mapped_column(DECIMAL, nullable=True)  # kg

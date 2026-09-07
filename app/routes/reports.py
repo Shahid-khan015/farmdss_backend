@@ -14,7 +14,12 @@ from app.middleware.auth import get_current_user
 from app.models.iot_reading import IoTReading
 from app.models.session import IoTAlert, OperationSession
 from app.models.user import User
-from app.routes.sessions import _assert_session_access, _to_utc
+from app.routes.sessions import (
+    _assert_session_access,
+    _backfill_legacy_billing,
+    _to_utc,
+    _worked_duration_minutes,
+)
 from app.schemas.session import (
     AlertSummaryItem,
     FieldObservationResponse,
@@ -23,12 +28,7 @@ from app.schemas.session import (
     SessionSummaryReport,
 )
 from app.services.report_service import ReportFilters, generate_report
-from app.services.field_area_service import finalize_session_area, parse_gps_points, compute_total_path_distance_m
-from app.services.operation_cost_service import (
-    compute_session_cost,
-    resolve_session_billing,
-    session_billing_differs_from_persisted,
-)
+from app.services.field_area_service import compute_total_path_distance_m, worked_gps_points
 from app.services.export_service import build_csv_bytes, build_pdf_bytes
 
 router = APIRouter(prefix="/api/v1/reports", tags=["Reports"])
@@ -181,18 +181,13 @@ def get_session_summary_report(
 
     _assert_session_access(session, current_user, db)
 
-    if session.status == "completed" and session.area_ha is None:
-        finalize_session_area(session_id, db)
-        db.commit()
-        db.refresh(session)
-
-    billing = resolve_session_billing(session, db)
-    if session.status == "completed" and session.area_ha is not None:
-        if session_billing_differs_from_persisted(session, billing):
-            compute_session_cost(session, db)
-            db.commit()
-            db.refresh(session)
-            billing = resolve_session_billing(session, db)
+    # The summary REPORTS the charge; it does not compute one. The only write here closes
+    # out a terminated session whose charge was never issued (legacy rows), and it is a
+    # no-op the moment `cost_finalized_at` is set. This endpoint previously re-resolved
+    # billing against the owner's *current* rate card on every request and overwrote the
+    # stored total whenever it differed -- so editing a rate silently re-billed sessions
+    # that had already been settled.
+    _backfill_legacy_billing(session, db)
 
     alerts = list(
         db.scalars(
@@ -204,8 +199,7 @@ def get_session_summary_report(
 
     duration_minutes: Optional[float] = None
     if session.started_at is not None:
-        end_dt = _to_utc(session.ended_at) if session.ended_at is not None else datetime.now(timezone.utc)
-        duration_minutes = max(0.0, (end_dt - _to_utc(session.started_at)).total_seconds() / 60.0)
+        duration_minutes = _worked_duration_minutes(session, db)
 
     session_start = _to_utc_opt(session.started_at) or datetime.now(timezone.utc)
     session_end = _to_utc_opt(session.ended_at) or datetime.now(timezone.utc)
@@ -313,7 +307,9 @@ def get_session_summary_report(
         for alert in alerts
     ]
 
-    gps_points = parse_gps_points(session_id, db)
+    # Worked path only (paused travel excluded), so the reported distance reconciles with
+    # the area the charge was computed on: distance_m x width_m / 10000 == area_ha.
+    gps_points = worked_gps_points(session_id, db)
     total_distance_m: Optional[float] = None
     if gps_points:
         raw_dist = compute_total_path_distance_m(gps_points)
@@ -332,9 +328,15 @@ def get_session_summary_report(
         duration_minutes=duration_minutes,
         area_ha=session.area_ha,
         total_distance_m=total_distance_m,
-        total_cost_inr=billing.total_cost_inr,
-        charge_per_ha_applied=billing.charge_per_ha_applied,
-        cost_note=billing.cost_note,
+        total_cost_inr=float(session.total_cost_inr) if session.total_cost_inr is not None else None,
+        charge_per_ha_applied=(
+            float(session.charge_per_ha_applied) if session.charge_per_ha_applied is not None else None
+        ),
+        charge_unit=session.charge_unit,
+        rate_currency=session.rate_currency,
+        billable_hours=float(session.billable_hours) if session.billable_hours is not None else None,
+        cost_note=session.cost_note,
+        cost_finalized_at=session.cost_finalized_at,
         alerts=alert_items,
         field_observations=[
             FieldObservationResponse.model_validate(observation)

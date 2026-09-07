@@ -51,7 +51,9 @@ class Settings(BaseSettings):
     ENABLE_IOT_HTTP_POLLER: bool = False
     ENABLE_IOT_MQTT: bool = False
     IOT_MQTT_BROKER: str = "io.adafruit.com"
-    IOT_MQTT_PORT: int = 1883
+    # 8883 is Adafruit's TLS port. Plaintext 1883 sends the AIO key in the clear.
+    IOT_MQTT_PORT: int = 8883
+    IOT_MQTT_TLS: bool = True
 
     # Poll cadence is gated on whether any session is running: a permanently hot poll keeps a
     # serverless Postgres compute awake and burns CPU for data nobody is reading. Set the two
@@ -67,6 +69,23 @@ class Settings(BaseSettings):
     IOT_STALE_AFTER_SEC: float = 20.0
     IOT_FETCH_THROUGH_COOLDOWN_SEC: float = 5.0
     IOT_FETCH_THROUGH_TIMEOUT_SEC: float = 8.0
+
+    # --- Session-gated live telemetry ---
+    # With MQTT as the hot path the poller becomes a slow backfill, so the two stop
+    # competing for the same data points.
+    IOT_BACKFILL_POLL_INTERVAL_SEC: float = 45.0
+    # Micro-batch: one write per N readings or per M seconds, whichever comes first.
+    IOT_BUFFER_MAX_ITEMS: int = 20
+    IOT_BUFFER_MAX_AGE_SEC: float = 4.0
+    # How long a transport parks before re-checking the database anyway -- a safety net
+    # for a status change that never called GATE.refresh (a restart mid-session, say).
+    IOT_GATE_RECHECK_SEC: float = 30.0
+
+    # --- Live WebSocket ---
+    WS_AUTH_TIMEOUT_SEC: float = 5.0
+    #: Close with 4401 this long before the token expires, so the client refreshes on a
+    #: healthy connection rather than failing at an arbitrary moment mid-pass.
+    WS_TOKEN_EXPIRY_MARGIN_SEC: float = 60.0
 
 
 settings = Settings()

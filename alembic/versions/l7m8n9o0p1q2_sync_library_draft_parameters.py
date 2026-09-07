@@ -43,7 +43,8 @@ down_revision = "k6l7m8n9o0p1"
 branch_labels = None
 depends_on = None
 
-# enum member name -> (A, B, C, Py/D)
+# enum member name -> (A, B, C, Py/D). These are ASABE D497 Table 1's
+# **secondary-tillage** rows, which is what the library originally carried.
 DRAFT_PARAMS = {
     "MB_PLOUGH":   (652.0, 0.0, 5.1, 0.20),
     "DISC_PLOUGH": (124.0, 6.4, 0.0, 0.00),
@@ -53,6 +54,20 @@ DRAFT_PARAMS = {
 
 
 def upgrade() -> None:
+    """Backfill rows that have no coefficients; never overwrite ones that do.
+
+    This originally updated **every** library row of a given implement type,
+    unconditionally. That made it destructive on re-run: D497 Table 1 tabulates
+    primary and secondary tillage separately (a field cultivator is A=46/B=2.8 for
+    primary, A=32/B=1.9 for secondary -- a 1.44x difference in draft), so a
+    primary-tillage row added to the seed was silently collapsed back onto the
+    secondary triple the next time migrations ran. The data gap was defended by
+    the migration meant to fix it.
+
+    The `asae_param_a IS NULL` guard makes this a backfill, which is all it was
+    ever meant to be: rows that predate the columns get values, rows that carry
+    deliberate ones keep them.
+    """
     conn = op.get_bind()
     for member, (a, b, c, pyd) in DRAFT_PARAMS.items():
         conn.execute(
@@ -60,7 +75,8 @@ def upgrade() -> None:
                 "UPDATE implements SET asae_param_a = :a, asae_param_b = :b, "
                 "asae_param_c = :c, vertical_horizontal_ratio = :pyd "
                 "WHERE is_library = true "
-                "AND CAST(implement_type AS text) = :member"
+                "AND CAST(implement_type AS text) = :member "
+                "AND asae_param_a IS NULL"
             ),
             {"a": a, "b": b, "c": c, "pyd": pyd, "member": member},
         )

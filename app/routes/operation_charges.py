@@ -7,11 +7,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.core.billing_units import is_per_hour_operation
 from app.middleware.auth import get_current_user, require_role
 from app.models.operation_charge import OperationCharge
 from app.models.user import User
 from app.schemas.operation_charge import (
-    PER_HOUR_OPERATION_TYPES,
     OperationChargeCreate,
     OperationChargeRead,
     OperationChargeUpdate,
@@ -34,8 +34,7 @@ def _to_read(charge: OperationCharge) -> OperationChargeRead:
 
 
 def _normalize_charge_row(row: OperationCharge) -> None:
-    op = (row.operation_type or "").strip().lower()
-    if op in PER_HOUR_OPERATION_TYPES:
+    if is_per_hour_operation(row.operation_type):
         if row.charge_per_hour is None or float(row.charge_per_hour) <= 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -86,8 +85,10 @@ def list_operation_charges(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # An owner's rate card is their commercial pricing: scope it to the owner who set it.
+    # Only researchers, who work across the whole dataset, see every owner's rates.
     stmt = select(OperationCharge)
-    if current_user.role == "owner":
+    if current_user.role != "researcher":
         stmt = stmt.where(OperationCharge.owner_id == current_user.id)
     rows = list(db.scalars(stmt.order_by(OperationCharge.operation_type.asc())).all())
     return [_to_read(row) for row in rows]

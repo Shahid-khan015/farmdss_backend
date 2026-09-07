@@ -109,22 +109,26 @@ def test_draft_force_is_linear_in_depth():
 def test_fi_soil_texture_factor_is_global(implement_type, texture, expected_fi):
     """Fi depends on soil texture alone -- all 12 implement x texture combinations.
 
+    Reverted to match `docs/tillage_dss (2).html` exactly: its `readCommonInputs`
+    reads Fi from one texture selector with no implement dimension at all. A
+    per-implement table (ASABE D497 Table 1: disc tools 1.0/0.88/0.78, cultivators
+    1.0/0.85/0.65) was reinstated for one session -- corroborated by
+    `farmdss/Rakesh Dss/Front _screen.frm` (Command6_Click), the 2006 VB6 tool this
+    DSS derives from -- and is still available as `constants.FI_FACTOR_BY_IMPLEMENT_TYPE`
+    if D497 fidelity is ever prioritised over HTML parity again.
+
     Measured through the draft equation rather than by reading the table, so this
     also pins that `Fi` is the only thing texture changes: everything else in
     Eq. 3.1 is held fixed, and the ratio to fine soil must therefore be exactly
     Fi for every implement class.
     """
-    # A cultivator's Eq. 3.1 `W` is its tool count, which the engine requires.
-    extra = (
-        {"number_of_tools": 9}
-        if implement_type is ImplementType.CULTIVATOR
-        else {}
-    )
+    # A cultivator's Eq. 3.1 `W` is its width in metres, same as every other
+    # implement now that DRAFT_WIDTH_IS_TOOL_COUNT is empty -- no tool count needed.
     fine_draft = estimate_draft_force(
-        make_inputs(implement_type=implement_type, soil_texture=SoilTexture.FINE, **extra)
+        make_inputs(implement_type=implement_type, soil_texture=SoilTexture.FINE)
     )
     draft = estimate_draft_force(
-        make_inputs(implement_type=implement_type, soil_texture=texture, **extra)
+        make_inputs(implement_type=implement_type, soil_texture=texture)
     )
     assert draft / fine_draft == pytest.approx(expected_fi)
 
@@ -695,23 +699,29 @@ def test_calculate_legacy_performance_intermediates_chain_together():
     assert results["field_capacity_theoretical"] == pytest.approx(s * 1.5 / 10.0)
 
 
-def test_reported_fuel_uses_the_preserved_drawbar_basis():
-    """Pins the LEGACY fuel basis so it cannot drift without a deliberate change.
+def test_reported_fuel_uses_the_drawbar_basis():
+    """Pins the fuel basis so it cannot drift without a deliberate change.
 
-    The DSS gives SFC in L/kW-h and never states the multiplicand; the engine
-    preserves `SFC * DBp` and reports the PTO-power reading only as a diagnostic.
+    Matches `docs/tillage_dss (2).html` exactly (`fuelLph = sfc * pdbKw`) and the
+    spreadsheet's `C65`. A PTO-power basis (`Ptr`, the power the engine actually
+    produces) was adopted for one session on physical grounds -- billing against
+    `DBp` discards the slip-loss fraction of real consumption -- and survives here
+    only as the `fuel_l_per_hour_pto_basis` diagnostic.
     """
     results = calculate_legacy_performance(make_inputs())
     sfc = results["specific_fuel_consumption"]
     assert sfc == pytest.approx(
         specific_fuel_consumption_l_per_kwh(results["required_pto_power"] / 45.0)
     )
+    assert results["fuel_basis"] == "drawbar"
     assert results["fuel_l_per_hour"] == pytest.approx(sfc * results["drawbar_power"])
     assert results["fuel_consumption_per_hectare"] == pytest.approx(
         results["fuel_l_per_hour"] / results["field_capacity_actual"]
     )
-    # The dimensionally-consistent alternative is reported but must feed nothing.
-    assert results["fuel_l_per_hour_pto_basis"] == pytest.approx(sfc * results["required_pto_power"])
+    # The PTO-power reading is reported but must feed nothing.
+    assert results["fuel_l_per_hour_pto_basis"] == pytest.approx(
+        sfc * results["required_pto_power"]
+    )
     assert results["fuel_l_per_hour_pto_basis"] != pytest.approx(results["fuel_l_per_hour"])
 
 
@@ -820,19 +830,13 @@ def test_draft_width_is_metres_for_full_width_tools():
         assert draft_width_parameter(it, 1.8, 9) == pytest.approx(1.8)
 
 
-def test_draft_width_is_the_tool_count_for_cultivators():
-    assert draft_width_parameter(ImplementType.CULTIVATOR, 2.2, 9) == pytest.approx(9.0)
-
-
-def test_draft_width_rejects_a_missing_tool_count():
-    """Refusing beats silently substituting the width.
-
-    An earlier revision fell back to metres so rows predating the column kept
-    running. That produces a meaningless answer rather than a merely understated
-    one -- see `test_missing_tool_count_would_have_nearly_cancelled_active_draft`.
+def test_draft_width_is_metres_for_cultivators_too():
+    """Reverted to match `docs/tillage_dss (2).html` exactly -- its `draftForceN`
+    takes only `widthM`, with no tool-count concept for any implement class,
+    cultivators included. `number_of_tools`, if supplied, is simply ignored.
     """
-    with pytest.raises(ValueError, match="number_of_tools"):
-        draft_width_parameter(ImplementType.CULTIVATOR, 2.2, None)
+    assert draft_width_parameter(ImplementType.CULTIVATOR, 2.2, 9) == pytest.approx(2.2)
+    assert draft_width_parameter(ImplementType.CULTIVATOR, 2.2, None) == pytest.approx(2.2)
 
 
 def test_draft_width_ignores_the_tool_count_for_full_width_tools():
@@ -842,14 +846,24 @@ def test_draft_width_ignores_the_tool_count_for_full_width_tools():
         assert draft_width_parameter(it, 1.8, 9) == pytest.approx(1.8)
 
 
-def test_draft_width_rejects_a_nonsensical_tool_count():
-    with pytest.raises(ValueError):
-        draft_width_parameter(ImplementType.CULTIVATOR, 2.2, 0)
+def test_draft_width_never_raises_on_the_tool_count_any_more():
+    """A missing or nonsensical tool count is simply ignored, not refused.
+
+    An earlier revision required `number_of_tools` for per-tool implement classes
+    and raised without it (`constants.DRAFT_WIDTH_IS_TOOL_COUNT = {"Cultivator"}`).
+    That guard is unreachable now that the set is empty -- see its docstring for
+    the D497 per-tool fidelity this reversion gives up.
+    """
+    assert draft_width_parameter(ImplementType.CULTIVATOR, 2.2, 0) == pytest.approx(2.2)
+    assert draft_width_parameter(ImplementType.CULTIVATOR, 2.2, -1) == pytest.approx(2.2)
 
 
-def test_cultivator_draft_per_metre_is_physically_plausible():
-    """W-in-metres makes draft/m identical at every size, which carries no
-    information and lands ~4x below a disc harrow. The tool count fixes both."""
+def test_cultivator_draft_per_metre_carries_no_size_information():
+    """W-in-metres makes draft/m identical at every cultivator size -- matching
+    `docs/tillage_dss (2).html` exactly. A tool-count basis (D497 Table 1's own
+    tabulation) would instead give a consistent ~2070 N/m regardless of width and
+    let draft/m vary meaningfully by tine spacing; this reversion gives that up.
+    """
     common = dict(
         implement_type=ImplementType.CULTIVATOR,
         asae_param_a=32.0, asae_param_b=1.9, asae_param_c=0.0,
@@ -860,11 +874,10 @@ def test_cultivator_draft_per_metre_is_physically_plausible():
     for width, tools in ((2.2, 9), (3.13, 13), (4.15, 17)):
         d = estimate_draft_force(make_inputs(width_m=width, number_of_tools=tools, **common))
         per_metre.append(d / width)
-    # Draft per metre must now vary only through tine spacing, and sit between a
-    # disc plough (~1975 N/m) and a disc harrow (~4050 N/m).
-    for v in per_metre:
-        assert 1500.0 < v < 4500.0
-    assert max(per_metre) - min(per_metre) < 0.05 * max(per_metre)
+    # The width cancels out of Eq. 3.1 when W is read in metres, so draft/metre is
+    # the same number (fi*(A+B*S+C*S^2)*depth) regardless of the implement's size.
+    assert per_metre[0] == pytest.approx(per_metre[1])
+    assert per_metre[1] == pytest.approx(per_metre[2])
 
 
 # --- Front lift is answered with ballast, not refused ------------------------
@@ -975,12 +988,16 @@ def test_fi_is_global_and_matches_the_reference_stack():
 
     The authority is the spreadsheet's "tractor and implement data" sheet, cells
     D50:F53 -- a three-row Soil Type/Fi table with no implement dimension -- and
-    the HTML tool's texture selector, which hard-codes the same three values.
+    `docs/tillage_dss (2).html`'s texture selector, which hard-codes the same three
+    values with no implement dimension either.
 
-    These are D497's *moldboard-plough* F row applied to every implement, so this
-    is a deliberate departure from D497's per-implement F rows (disc tools would
-    be 0.88/0.78, cultivators 0.85/0.65). It was chosen for cross-tool
-    consistency with the reference stack; see constants.FI_FACTOR_BY_TEXTURE.
+    A per-implement table (ASABE D497 Table 1: disc tools 0.88/0.78, cultivators
+    0.85/0.65) was reinstated for one session, corroborated by
+    `farmdss/Rakesh Dss/Front _screen.frm` (Command6_Click), the 2006 VB6 tool this
+    DSS derives from -- and is still available as
+    `constants.FI_FACTOR_BY_IMPLEMENT_TYPE`, unused by `fi_factor` now. It was
+    reverted so the engine matches `tillage_dss (2).html` exactly; see that
+    constant's docstring for the D497-fidelity cost of doing so.
     """
     from app.core.constants import FI_FACTOR_BY_TEXTURE as FI
 
@@ -1002,36 +1019,182 @@ def test_fi_is_global_and_matches_the_reference_stack():
         assert applied == {FI[texture.value]}
 
 
-def test_missing_tool_count_would_have_nearly_cancelled_active_draft():
-    """Why the missing tool count raises instead of falling back to metres.
+# --- Standalone PTO-powered implement (rotavator / power harrow used alone) ----
 
-    In an active-passive combination `Deff = Dp + Da - Ta`. Substituting the
-    width in metres for a cultivator understates `Dp` roughly 4x, which here is
-    the same order as the rotor's forward thrust -- so `Deff` collapses to
-    nothing and the run SUCCEEDS with a plausible-looking verdict built on no
-    draft. That is why the fallback was removed; this pins the arithmetic.
 
-    `fi` is the global medium-soil factor. It was 0.85 (the old per-implement
-    cultivator value) while Fi was implement-keyed; under the global table the
-    understated draft no longer merely cancels the thrust but overshoots into
-    negative effective draft, which the engine rejects outright. The
-    demonstration is strictly stronger, so the bound below is one-sided.
+def _standalone_active_inputs(**overrides) -> LegacyInputs:
+    return make_inputs(
+        implement_type=ImplementType.ROTAVATOR,
+        width_m=1.5,
+        weight_kg=380.0,
+        vertical_horizontal_ratio=0.0,
+        asae_param_a=0.0,
+        asae_param_b=0.0,
+        asae_param_c=0.0,
+        **overrides,
+    )
+
+
+def test_standalone_active_implement_reports_null_for_the_whole_draft_chain():
+    """Not applicable is reported as None, never as 0.0.
+
+    A rigidly-mounted PTO implement has no towed draft, so Eq. 3.1's chain has
+    nothing to compute. Zeros would render as real numbers in the UI and would
+    silently satisfy any downstream `is not None` check.
     """
-    fi, a, b, c = 0.70, 32.0, 1.9, 0.0
-    speed_kmh, depth_cm, width_m, tools = 4.0, 12.0, 2.2, 9
+    results = calculate_legacy_performance(
+        _standalone_active_inputs(rotor_pto_power_kw=9.0, rotor_speed_rpm=540.0)
+    )
+    assert results["is_standalone_active_implement"] is True
+    for key in (
+        "draft_force",
+        "drawbar_power",
+        "slip",
+        "coefficient_net_traction",
+        "traction_efficiency",
+        "legacy_rear_axle_load_n",
+        "legacy_mobility_number_rear",
+        "ballast_front_required",
+        "ballast_rear_required",
+    ):
+        assert results[key] is None, f"{key} should be None, got {results[key]!r}"
 
-    def draft(w: float) -> float:
-        return fi * (a + b * speed_kmh + c * speed_kmh**2) * w * depth_cm
 
-    correct = draft(float(tools))
-    substituted = draft(width_m)
+def test_standalone_active_implement_powers_fuel_from_its_own_rated_pto_draw():
+    ppto = 9.0
+    results = calculate_legacy_performance(
+        _standalone_active_inputs(rotor_pto_power_kw=ppto)
+    )
+    # Put is the implement's own draw against available power -- no TE step exists.
+    assert results["power_utilization"] == pytest.approx(ppto / (45.0 * 0.8) * 100.0)
+    assert results["pto_power_fraction_effective"] == pytest.approx(ppto / 45.0)
+    assert results["fuel_l_per_hour"] == pytest.approx(
+        specific_fuel_consumption_l_per_kwh(ppto / 45.0) * ppto
+    )
+    assert results["fuel_basis"] == "pto"
+    # Field capacity is still fully knowable from width and speed.
+    assert results["field_capacity_actual"] > 0
 
-    # Rotavator 7 ft: eta_r 0.32, P_PTO 4.5 kW -> Ta = eta_r*P/V
-    thrust_n = 0.32 * 4500.0 / (speed_kmh / 3.6)
-    rotor_resistance_n = 420.0
 
-    assert correct / substituted == pytest.approx(float(tools) / width_m)
-    # Correct effective draft is a real, sizeable load...
-    assert (correct + rotor_resistance_n - thrust_n) > 2000.0
-    # ...whereas the substituted one collapses to nothing (here, past zero).
-    assert (substituted + rotor_resistance_n - thrust_n) < 50.0
+def test_standalone_active_implement_refuses_without_a_rated_pto_draw():
+    """Refusing beats inventing: there is no other way to know its power demand."""
+    with pytest.raises(ValueError, match="rated PTO power draw"):
+        calculate_legacy_performance(_standalone_active_inputs())
+
+
+def test_a_towed_implement_is_unaffected_by_the_standalone_branch():
+    """The branch keys on the implement being PTO-powered, nothing else."""
+    results = calculate_legacy_performance(make_inputs())
+    assert results.get("is_standalone_active_implement") is None
+    assert results["draft_force"] > 0
+
+
+# --- DSS Table 4.2 advisory conditions ----------------------------------------
+
+
+def _envelope(**overrides):
+    from app.core.dss_shared import result_envelope
+
+    base = dict(
+        slip=8.0,
+        net_traction_coefficient=0.30,
+        front_weight_utilization=0.28,
+        fi=0.70,
+        put_pct=90.0,
+        field_eff_pct=80.0,
+        converged=True,
+    )
+    base.update(overrides)
+    return result_envelope(**base)
+
+
+def test_table_4_2_fires_nothing_when_every_condition_is_satisfied():
+    """The document gives no "all clear" message, so none is invented."""
+    env = _envelope()
+    assert env.recommendation_messages == []
+    assert env.recommendations == ""
+
+
+def test_table_4_2_slip_condition():
+    env = _envelope(slip=16.0)
+    assert env.recommendation_messages == [
+        "Reduce depth or speed of operation or ballast rear axle of tractor"
+    ]
+
+
+def test_table_4_2_mu_condition_is_soil_dependent():
+    """mu 0.58 clears the firm ceiling (0.60) but breaches the medium one (0.55)."""
+    assert _envelope(net_traction_coefficient=0.58, fi=1.0).recommendation_messages == []
+    assert _envelope(net_traction_coefficient=0.58, fi=0.70).recommendation_messages == [
+        "Reduce depth or speed of operation or ballast rear axle of tractor"
+    ]
+    # Coarse soil is softest, so the same mu breaches there too.
+    assert _envelope(net_traction_coefficient=0.45, fi=0.45).recommendation_messages == [
+        "Reduce depth or speed of operation or ballast rear axle of tractor"
+    ]
+
+
+def test_table_4_2_kwef_condition_names_the_front_axle():
+    env = _envelope(front_weight_utilization=0.15)
+    assert env.recommendation_messages == [
+        "Reduce depth or speed of operation or ballast front axle of tractor"
+    ]
+
+
+def test_table_4_2_put_condition_is_100_not_90():
+    """The old ad hoc rule fired at >90; the document says >100."""
+    assert _envelope(put_pct=95.0).recommendation_messages == []
+    assert _envelope(put_pct=101.0).recommendation_messages == [
+        "Reduce depth or speed of operation"
+    ]
+
+
+def test_table_4_2_deduplicates_the_shared_rear_ballast_message():
+    """Slip and mu share one message; it must appear once, not twice."""
+    env = _envelope(slip=16.0, net_traction_coefficient=0.90)
+    assert env.recommendation_messages == [
+        "Reduce depth or speed of operation or ballast rear axle of tractor"
+    ]
+
+
+def test_low_slip_advisory_is_additive_and_not_part_of_table_4_2():
+    """Carried over from the 2006 VB6 tool this DSS derives from (Command6_Click,
+    "slip is less than 8%"); Table 4.2 itself is silent on low slip.
+
+    Distinct message text from the four DSS-EXACT ones, so it can never be
+    mistaken for spec advice.
+    """
+    env = _envelope(slip=5.0)
+    assert env.recommendation_messages == [
+        "Slip is below 8% -- increase depth or speed of operation to make better "
+        "use of available traction"
+    ]
+
+
+def test_low_slip_advisory_does_not_fire_inside_table_4_2s_optimal_band():
+    """8-15% is the band Table 4.2 itself treats as unproblematic (neither the
+    low-slip advisory nor the high-slip rule fires there)."""
+    assert _envelope(slip=8.0).recommendation_messages == []
+    assert _envelope(slip=10.0).recommendation_messages == []
+    assert _envelope(slip=15.0).recommendation_messages == []
+
+
+def test_low_slip_advisory_is_skipped_when_slip_is_absent():
+    """A standalone active implement has no slip at all -- must not fire on None."""
+    env = _envelope(slip=None, net_traction_coefficient=None, fi=None, put_pct=50.0)
+    assert env.recommendation_messages == []
+
+
+def test_table_4_2_skips_conditions_whose_input_is_absent():
+    """A standalone active implement has no slip, mu or Kwef -- only Put applies."""
+    env = _envelope(
+        slip=None, net_traction_coefficient=None, front_weight_utilization=None,
+        fi=None, put_pct=120.0,
+    )
+    assert env.recommendation_messages == ["Reduce depth or speed of operation"]
+
+
+def test_the_unspecified_te_and_fuel_rules_are_gone():
+    """TE<60 and fuel>45 L/ha had no basis in the specification and were removed."""
+    env = _envelope(put_pct=50.0)
+    assert env.recommendation_messages == []

@@ -281,9 +281,15 @@ def get_simulation(
 
 
 def _require_implement_fields(implement: Implement, *, label: str = "Implement") -> None:
-    """Fields a PASSIVE tool needs to run through the DSS draft equation."""
+    """Fields a PASSIVE tool needs to run through the DSS draft equation.
+
+    Checks `resolved_width_m` (working_width_m, falling back to width), not
+    `width` alone -- a record with only `working_width_m` set used to 422 here
+    even though it carries a perfectly usable width. See
+    `Implement.resolved_width_m` for the shared resolution rule.
+    """
     required = [
-        ("width", implement.width),
+        ("width", implement.resolved_width_m),
         ("weight", implement.weight),
         ("cg_distance_from_hitch", implement.cg_distance_from_hitch),
         ("asae_param_a", implement.asae_param_a),
@@ -556,7 +562,7 @@ def run_simulation(
             "speed": speed,
             "depth": depth,
             "cone_index": cone_index,
-            "implement_width": implement.width,
+            "implement_width": implement.resolved_width_m,
             "pto_power": tractor.pto_power,
         }
     )
@@ -567,7 +573,7 @@ def run_simulation(
         width_range_errors = [
             e
             for e in validate_operating_ranges(
-                {"speed": speed, "depth": depth, "cone_index": cone_index, "implement_width": implement_2.width, "pto_power": tractor.pto_power}
+                {"speed": speed, "depth": depth, "cone_index": cone_index, "implement_width": implement_2.resolved_width_m, "pto_power": tractor.pto_power}
             )
             if e["field"] == "implement_width"
         ]
@@ -626,7 +632,7 @@ def run_simulation(
                     **tractor_kwargs,
                     tool_1=PassiveToolInputs(
                         implement_type=implement.implement_type,
-                        width_m=float(implement.width),
+                        width_m=float(implement.resolved_width_m),
                         weight_kg=float(implement.weight),
                         cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
                         asae_param_a=float(implement.asae_param_a),
@@ -637,7 +643,7 @@ def run_simulation(
                     ),
                     tool_2=PassiveToolInputs(
                         implement_type=implement_2.implement_type,
-                        width_m=float(implement_2.width),
+                        width_m=float(implement_2.resolved_width_m),
                         weight_kg=float(implement_2.weight),
                         cg_distance_from_hitch_m=float(implement_2.cg_distance_from_hitch),
                         asae_param_a=float(implement_2.asae_param_a),
@@ -647,6 +653,11 @@ def run_simulation(
                         number_of_tools=implement_2.number_of_tools,
                     ),
                     interaction_coefficient=float(payload.interaction_coefficient),
+                    effective_width_override_m=(
+                        float(payload.effective_width_override_m)
+                        if payload.effective_width_override_m is not None
+                        else None
+                    ),
                 )
             )
         elif payload.combination_type == SimulationCombinationType.ACTIVE_PASSIVE:
@@ -655,7 +666,7 @@ def run_simulation(
                     **tractor_kwargs,
                     passive_tool=PassiveToolInputs(
                         implement_type=implement.implement_type,
-                        width_m=float(implement.width),
+                        width_m=float(implement.resolved_width_m),
                         weight_kg=float(implement.weight),
                         cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
                         asae_param_a=float(implement.asae_param_a),
@@ -679,7 +690,7 @@ def run_simulation(
             perf_inputs = PerformanceInputs(
                 **tractor_kwargs,
                 implement_type=implement.implement_type,
-                width_m=float(implement.width),
+                width_m=float(implement.resolved_width_m),
                 weight_kg=float(implement.weight),
                 cg_distance_from_hitch_m=float(implement.cg_distance_from_hitch),
                 vertical_horizontal_ratio=_opt_float(implement.vertical_horizontal_ratio),

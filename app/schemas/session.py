@@ -64,7 +64,7 @@ class SessionStartRequest(BaseModel):
 
 
 class SessionStopRequest(BaseModel):
-    notes: Optional[str] = None
+    """Stop takes no parameters. Kept as a body model so the existing POST shape holds."""
 
 
 class FieldObservationCreate(BaseModel):
@@ -173,8 +173,15 @@ class SessionResponse(BaseModel):
     alerts_count: Optional[int] = None
     unacknowledged_alerts: Optional[int] = None
     total_cost_inr: Optional[float] = None
+    #: The rate locked at session start. Rs/ha or Rs/hr -- `charge_unit` says which.
     charge_per_ha_applied: Optional[float] = None
+    charge_unit: Optional[str] = None
+    rate_currency: Optional[str] = None
+    #: Worked hours net of pauses; set for per-hour operations once the session ends.
+    billable_hours: Optional[float] = None
     cost_note: Optional[str] = None
+    #: Non-null means the charge is final and will not change.
+    cost_finalized_at: Optional[datetime] = None
     created_at: datetime
 
 
@@ -204,7 +211,11 @@ class SessionSummaryReport(BaseModel):
     total_distance_m: Optional[float] = None
     total_cost_inr: Optional[float]
     charge_per_ha_applied: Optional[float]
+    charge_unit: Optional[str] = None
+    rate_currency: Optional[str] = None
+    billable_hours: Optional[float] = None
     cost_note: Optional[str]
+    cost_finalized_at: Optional[datetime] = None
     alerts: list[AlertSummaryItem]
     field_observations: list["FieldObservationResponse"] = []
     observations_count: int = 0

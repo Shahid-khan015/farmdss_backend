@@ -23,6 +23,7 @@ from app.core.dss_shared import (
     require_finite,
     require_positive,
     result_envelope,
+    round_half_away_from_zero,
     safe_div,
     safe_sqrt,
     specific_fuel_consumption_l_per_kwh,
@@ -149,6 +150,33 @@ def test_field_capacity_exposes_raw_efficiency_alongside_the_clamped_one():
     assert cap.field_eff_raw_pct == pytest.approx((cap.fc_ac / cap.fc_th) * 100.0)
 
 
+def test_round_half_away_from_zero_disagrees_with_python_builtin_at_ties():
+    """Pins the exact cases where Excel's ROUND()/JS's Math.round() diverge from
+    Python's banker's-rounding builtin -- an even integer part with a .5 tie."""
+    assert round_half_away_from_zero(2.5) == 3
+    assert round(2.5) == 2  # the builtin's tie-to-even, for contrast
+    assert round_half_away_from_zero(0.5) == 1
+    assert round(0.5) == 0
+    assert round_half_away_from_zero(4.5) == 5
+    # Odd integer part: both rules agree, so no behavioural change there.
+    assert round_half_away_from_zero(1.5) == round(1.5) == 2
+    assert round_half_away_from_zero(3.5) == round(3.5) == 4
+    # Negative ties round away from zero too.
+    assert round_half_away_from_zero(-2.5) == -3
+
+
+def test_field_capacity_number_turns_matches_excel_and_html_at_a_half_integer_ratio():
+    """`field_width/width == 2.5` is exactly the ratio where Excel's
+    `C68 = ROUND(C12/C14, 0)` and both HTML's `Math.round()` round up to 3,
+    while Python's builtin `round()` would round down to 2. Regression guard
+    for the fix: `field_capacity` must agree with the reference, not the
+    builtin's tie-to-even rule.
+    """
+    cap = field_capacity(speed_kmh=4.0, width_m=40.0, field_area_ha=2.0, field_width_m=100.0)
+    assert cap.number_turns == 3
+    assert cap.number_turns != round(100.0 / 40.0)  # the builtin would say 2
+
+
 # --- Specific fuel consumption ------------------------------------------------
 
 
@@ -201,19 +229,33 @@ def test_extra_pto_power_enters_put_and_x_but_not_drawbar_power():
     assert power_and_fuel(extra_pto_kw=0.0, **POWER_KW).put_pct == pytest.approx(base.put_pct)
 
 
-def test_fuel_uses_the_preserved_drawbar_basis_and_reports_the_pto_basis_separately():
-    """The DSS never states what SFC [L/kW-h] is multiplied by.
+def test_fuel_uses_the_drawbar_basis_and_reports_the_pto_basis_separately():
+    """Fuel is billed against drawbar power, matching `docs/tillage_dss (2).html`
+    exactly (`powerAndFuel`: `fuelLph = sfc * pdbKw`) and the spreadsheet's `C65`.
 
-    `fuel_lph = SFC * DBp` is the preserved LEGACY behaviour and is what feeds
-    every reported fuel figure; the dimensionally-consistent PTO-power reading is
-    reported alongside it and must feed nothing.
+    A PTO-power basis was adopted for one session on physical grounds
+    (`Ptr = DBp/(TE*eta_t)` is what the engine actually makes, and burns fuel to
+    make it regardless of how much survives wheel slip) -- that argument still
+    holds physically, but production reverted to drawbar for HTML parity. The PTO
+    reading survives as the diagnostic `fuel_lph_pto_basis`, feeding nothing.
     """
     p = power_and_fuel(extra_pto_kw=6.0, **POWER_KW)
+    assert p.fuel_basis == "drawbar"
     assert p.fuel_lph == pytest.approx(p.sfc * p.pdb_kw)
+    assert p.fuel_lph == pytest.approx(p.fuel_lph_drawbar_basis)
+    # The PTO-power reading survives as a diagnostic, and must feed nothing.
     assert p.fuel_lph_pto_basis == pytest.approx(p.sfc * (p.ptr_kw + 6.0))
     assert p.fuel_lph != pytest.approx(p.fuel_lph_pto_basis)
-    # Only the drawbar basis reaches the reported per-hectare figure.
     assert p.fuel_l_per_ha == pytest.approx(p.fuel_lph / POWER_KW["fc_ac"])
+
+
+def test_the_two_fuel_bases_differ_by_exactly_the_traction_loss():
+    """Pins the size of the difference: the ratio is 1/(TE x eta_t), nothing else."""
+    p = power_and_fuel(extra_pto_kw=0.0, **POWER_KW)
+    expected = 1.0 / (
+        POWER_KW["te_pct"] / 100.0 * POWER_KW["transmission_efficiency_pct"] / 100.0
+    )
+    assert p.fuel_lph_pto_basis / p.fuel_lph == pytest.approx(expected)
 
 
 def test_overall_efficiency_uses_the_centralised_calorific_value():
@@ -267,18 +309,22 @@ def test_put_load_status_table(put, expected):
 
 def test_result_envelope_reports_load_status_when_converged():
     env = result_envelope(
-        slip=8.0, draft_n=5000.0, te_pct=70.0, fuel_l_per_ha=20.0,
-        put_pct=97.0, field_eff_pct=80.0, converged=True,
+        slip=8.0, net_traction_coefficient=0.30, front_weight_utilization=0.28,
+        fi=0.70, put_pct=97.0, field_eff_pct=80.0, converged=True,
     )
     assert env.load_status == "Tractor is properly loaded"
     assert env.status_message == env.load_status
-    assert env.recommendation_messages == env.recommendations.split("; ")
+    # Nothing in Table 4.2 fires here: slip 8 < 15, mu 0.30 < 0.55 (medium),
+    # Kwef 0.28 > 0.20, Put 97 < 100. The document gives no "all clear" message,
+    # so the absence of advice is the answer -- and the list must be empty, not [""].
+    assert env.recommendations == ""
+    assert env.recommendation_messages == []
 
 
 def test_result_envelope_falls_back_to_status_when_not_converged():
     env = result_envelope(
-        slip=20.0, draft_n=5000.0, te_pct=40.0, fuel_l_per_ha=60.0,
-        put_pct=130.0, field_eff_pct=55.0, converged=False,
+        slip=20.0, net_traction_coefficient=0.70, front_weight_utilization=0.10,
+        fi=0.70, put_pct=130.0, field_eff_pct=55.0, converged=False,
     )
     assert env.status_message == env.status
     assert env.status_message != env.load_status

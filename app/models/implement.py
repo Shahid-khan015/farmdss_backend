@@ -69,6 +69,28 @@ class Implement(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     is_library: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False, index=True)
 
+    @property
+    def resolved_width_m(self) -> Optional[Decimal]:
+        """The one working width every subsystem should read, m.
+
+        `working_width_m` takes precedence when set, falling back to `width`
+        otherwise. This used to be two independent decisions: the simulation
+        engine read `width` only, while session/GPS field-area tracking read
+        `working_width_m` first and `width` second (`routes/sessions.py`). A
+        record with only `working_width_m` populated tracked field area
+        correctly but 422'd on every simulation ("missing width"), and nothing
+        caught the two subsystems drifting apart. Both routes now call this
+        property instead of reading either column directly, so there is one
+        rule, enforced in one place.
+
+        `working_width_m` is a plain `float` column (not `Decimal`, unlike
+        `width`); wrapped in `Decimal(str(...))` here so callers get one
+        consistent numeric type regardless of which column answered.
+        """
+        if self.working_width_m is not None:
+            return Decimal(str(self.working_width_m))
+        return self.width
+
     simulations: Mapped[list["Simulation"]] = relationship(
         back_populates="implement",
         foreign_keys="Simulation.implement_id",

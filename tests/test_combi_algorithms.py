@@ -116,6 +116,47 @@ def test_combined_draft_applies_interaction_coefficient():
     assert r_with_ki["draft_force"] < r_no_ki["draft_force"]
 
 
+# --- Effective width override (F5) --------------------------------------------
+#
+# DSS Section 4 gives no formula for combi swath width; both reference HTML
+# tools default to max(width_1, width_2) and let the operator override it for
+# non-tandem coverage. `effective_width_override_m` mirrors that exactly,
+# including the reference's own `Number.isFinite(override) && override > 0`
+# guard -- a non-positive override is treated the same as no override at all.
+
+
+def test_effective_width_override_is_used_when_positive():
+    """TOOL_1=1.0 m, TOOL_2=1.2 m -> default max() is 1.2 m. An explicit 2.5 m
+    override (a non-tandem coverage width) must replace it, driving field
+    capacity proportionally."""
+    default = calculate_passive_passive_performance(make_pp_inputs())
+    overridden = calculate_passive_passive_performance(
+        make_pp_inputs(effective_width_override_m=2.5)
+    )
+    assert default["field_capacity_theoretical"] == pytest.approx(
+        overridden["field_capacity_theoretical"] * (1.2 / 2.5)
+    )
+
+
+def test_effective_width_override_absent_preserves_max_of_the_two_tools():
+    """The default (None) behaviour is unchanged: max(1.0, 1.2) = 1.2 m."""
+    result = calculate_passive_passive_performance(make_pp_inputs())
+    speed_kmh = TRACTOR_COMMON["speed_kmh"]
+    assert result["field_capacity_theoretical"] == pytest.approx(speed_kmh * 1.2 / 10.0)
+
+
+@pytest.mark.parametrize("bad_override", [0.0, -1.0])
+def test_effective_width_override_falls_back_to_max_when_non_positive(bad_override):
+    """Matches the HTML's own guard: `override > 0` -- zero or negative is
+    treated as absent, not passed through to field_capacity (which would raise
+    on a non-positive width)."""
+    result = calculate_passive_passive_performance(
+        make_pp_inputs(effective_width_override_m=bad_override)
+    )
+    speed_kmh = TRACTOR_COMMON["speed_kmh"]
+    assert result["field_capacity_theoretical"] == pytest.approx(speed_kmh * 1.2 / 10.0)
+
+
 def test_interaction_coefficient_out_of_range_rejected():
     # Validated before any traction maths, so this holds regardless of Bn'.
     with pytest.raises(ValueError):
@@ -522,6 +563,11 @@ def test_fi_is_applied_identically_in_all_three_modes(texture, expected_fi):
 
     Active-passive is checked on `draft_passive` rather than `draft_force`:
     Deff = Dp + Da - Ta also carries the rotor terms, which do not scale with Fi.
+
+    A per-implement Fi table (TOOL_1/MB Plough, TOOL_2/Cultivator and
+    `PASSIVE_TOOL_AP`/Disc Harrow would each have scaled differently) was adopted
+    for one session and reverted for `docs/tillage_dss (2).html` parity -- see
+    `constants.FI_FACTOR_BY_IMPLEMENT_TYPE`.
     """
     def ratio(run, key, **kwargs):
         fine = run(soil_texture=SoilTexture.FINE, **kwargs)[key]
@@ -554,7 +600,7 @@ def test_fi_is_applied_identically_in_all_three_modes(texture, expected_fi):
     assert ratio(active_passive, "draft_passive") == pytest.approx(expected_fi)
 
     # Both tools of the pair scale together -- an MB plough and a cultivator,
-    # which had *different* Fi rows before this change (0.70 vs 0.85 in medium).
+    # which would carry *different* Fi rows under the per-implement table.
     assert ratio(passive_passive, "draft_1") == pytest.approx(expected_fi)
     assert ratio(passive_passive, "draft_2") == pytest.approx(expected_fi)
 
@@ -908,13 +954,20 @@ def test_passive_passive_draft_rises_with_depth_speed_and_width():
 
 
 def test_passive_passive_softer_soil_lowers_bn_and_raises_slip():
-    """Cone index drives the wheel numeric, which drives slip."""
+    """Cone index drives the wheel numeric, which drives slip.
+
+    TE is the envelope form (`mu*(1-S)/mu_g`), which is monotonically increasing in
+    slip with no interior optimum -- see
+    `test_envelope_te_is_monotonic_in_slip_so_no_optimum_exists` in
+    test_legacy_algorithms.py. Softer soil raising slip therefore raises the
+    reported TE too, not lowers it; this no longer asserts otherwise.
+    """
     firm = calculate_passive_passive_performance(make_pp_inputs(cone_index_kpa=2000.0))
     soft = calculate_passive_passive_performance(make_pp_inputs(cone_index_kpa=500.0))
 
     assert soft["legacy_mobility_number_rear"] < firm["legacy_mobility_number_rear"]
     assert soft["slip"] >= firm["slip"]
-    assert soft["traction_efficiency"] <= firm["traction_efficiency"]
+    assert soft["traction_efficiency"] >= firm["traction_efficiency"]
 
 
 def test_passive_passive_reports_a_clean_diagnostic_when_soil_cannot_pull():

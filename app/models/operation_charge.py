@@ -3,11 +3,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, Column, DateTime, Float, ForeignKey, String, Uuid, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, Column, DateTime, ForeignKey, Numeric, String, Uuid, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from app.database import Base
+from app.models.mixins import uuid_server_default
 
 
 class OperationCharge(Base):
@@ -24,7 +25,7 @@ class OperationCharge(Base):
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
+        server_default=uuid_server_default(),
     )
     owner_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -33,8 +34,10 @@ class OperationCharge(Base):
         index=True,
     )
     operation_type = Column(String(50), nullable=False)
-    charge_per_ha = Column(Float, nullable=False)
-    charge_per_hour = Column(Float, nullable=True)
+    # Money is Numeric, not Float: these rates are multiplied into a rupee amount that is
+    # persisted and shown to a farmer as the final bill, so the arithmetic has to be exact.
+    charge_per_ha = Column(Numeric(12, 4), nullable=False)
+    charge_per_hour = Column(Numeric(12, 4), nullable=True)
     currency = Column(String(10), nullable=False, server_default=text("'INR'"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

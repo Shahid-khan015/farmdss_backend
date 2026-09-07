@@ -1,4 +1,41 @@
+"""Seed the reference tractor/implement library.
+
+Data source: `app/utils/seed_data/seed_tractors.json` (18 tractors) and
+`seed_implements.json` (27 implements), the canonical HTML-library-format
+datasets. Records are mapped onto `Tractor`/`TireSpecification`/`Implement`
+kwargs and inserted **exactly as the JSON provides them** -- no merging,
+correction, or invented numeric values. The only two departures from a literal
+copy are structural, not numeric, and are documented at their exact source:
+
+- `Tractor.model` is `NOT NULL`, but the JSON carries only one `name` string
+  with no separate make/model split -- see `_tractor_kwargs_from_json`.
+- `transmission_efficiency` / `power_reserve` are not per-tractor fields in
+  either the JSON or the reference HTML/Excel tools (they are global operating
+  parameters there, defaulted to 86% / 20% in the UI) -- see the two module
+  constants below.
+
+**Taxonomy gap.** 3 of the 27 implement records use `"type": "power_harrow"`,
+which has no corresponding `ImplementType` enum member (the enum has
+MB_PLOUGH / DISC_PLOUGH / CULTIVATOR / DISC_HARROW passive, and ROTAVATOR /
+DISC_HARROW_POWERED / CULTIVATOR_POWERED active -- nothing shaped like a power
+harrow). Mapping it onto an existing type would be exactly the kind of
+correction this module is built to avoid, so these 3 records are skipped, not
+guessed at. Adding `ImplementType.POWER_HARROW` (and deciding how
+`implement_taxonomy.py` classifies it) would need its own sign-off, since it
+touches the engine's type system, not just seed data.
+
+Two entry points:
+- `seed_library_if_empty` -- safe for automatic use (only runs against an
+  empty library), wired into app startup.
+- `reseed_library_replace_all` -- destructive full replace, for deliberate
+  manual use only. See its own docstring before calling it.
+"""
+
 from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -7,12 +44,130 @@ from app.models.implement import Implement
 from app.models.tire_specification import TireSpecification
 from app.models.tractor import Tractor
 
+_SEED_DATA_DIR = Path(__file__).resolve().parent / "seed_data"
+
+# Reference tool's own global operating-parameter defaults -- Excel C27/C28,
+# and both HTML tools' own "transEff"/"powerReserve" input defaults (86 / 20).
+# Neither the JSON library nor the reference tractor objects carry these
+# per-tractor; every tractor gets the same value because the reference itself
+# treats them as one shared operating condition, not a tractor attribute.
+_DEFAULT_TRANSMISSION_EFFICIENCY_PCT = 86.0
+_DEFAULT_POWER_RESERVE_PCT = 20.0
+
+# JSON "type" string -> ImplementType. "power_harrow" is deliberately absent --
+# see the module docstring.
+_IMPLEMENT_TYPE_BY_JSON_KEY = {
+    "moldboard_plough": ImplementType.MB_PLOUGH,
+    "disc_plough": ImplementType.DISC_PLOUGH,
+    "cultivator": ImplementType.CULTIVATOR,
+    "disc_harrow": ImplementType.DISC_HARROW,
+    "rotavator": ImplementType.ROTAVATOR,
+}
+
+
+def _load_json(filename: str) -> list[dict]:
+    with open(_SEED_DATA_DIR / filename, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _tractor_kwargs_from_json(record: dict) -> "tuple[dict[str, Any], dict[str, Any]]":
+    """Map one `seed_tractors.json` record onto Tractor + TireSpecification kwargs.
+
+    `model` is `NOT NULL` but the JSON carries only a single `name` string with
+    no make/model split; `name` is duplicated into `manufacturer` and `model`
+    rather than hand-splitting it (as the previous hardcoded seed data did),
+    since the JSON draws no line between the two itself and splitting it back
+    up would be an inference the source data doesn't license.
+
+    `Wt` (total static weight) has no column of its own -- both `Tractor` and
+    the engine derive it fresh from front + rear axle weight every time -- so
+    it is present in the JSON but intentionally not stored anywhere.
+    """
+    tractor_kwargs = dict(
+        name=record["name"],
+        manufacturer=record["name"],
+        model=record["name"],
+        pto_power=record["Pt"],
+        rated_engine_speed=record["N_engine"],
+        max_engine_torque=record["Tmax"],
+        wheelbase=record["L_wb"],
+        front_axle_weight=record["Wf_kg"],
+        rear_axle_weight=record["Wr_kg"],
+        hitch_distance_from_rear=record["Hd"],
+        cg_distance_from_rear=record["Xcgt"],
+        # Redundant fallback the engine reads only when TireSpecification
+        # itself lacks a rolling radius (routes/simulations.py's
+        # _resolve_rolling_radii) -- derived from this same record's own
+        # rr_mm, not a separately sourced figure.
+        rear_wheel_rolling_radius=record["rr_mm"] / 1000.0,
+        drive_mode=DriveMode.WD2,
+        transmission_efficiency=_DEFAULT_TRANSMISSION_EFFICIENCY_PCT,
+        power_reserve=_DEFAULT_POWER_RESERVE_PCT,
+        is_library=True,
+    )
+    tire_kwargs = dict(
+        tire_type=TireType.BIAS_PLY,
+        front_tire_size=record["tireFront"],
+        front_overall_diameter=record["df_mm"],
+        front_section_width=record["bf_mm"],
+        front_static_loaded_radius=record["rslf_mm"],
+        front_rolling_radius=record["rf_mm"],
+        rear_tire_size=record["tireRear"],
+        rear_overall_diameter=record["dr_mm"],
+        rear_section_width=record["br_mm"],
+        rear_static_loaded_radius=record["rslr_mm"],
+        rear_rolling_radius=record["rr_mm"],
+    )
+    return tractor_kwargs, tire_kwargs
+
+
+def _implement_kwargs_from_json(record: dict) -> Optional["dict[str, Any]"]:
+    """Map one `seed_implements.json` record onto Implement kwargs, or `None`
+    when its `type` has no corresponding `ImplementType` -- see the module
+    docstring's taxonomy-gap note.
+
+    `category` ("primary"/"secondary"/"active") and `draft_basis`
+    ("width"/"tools") are present in the JSON but have no column to hold them:
+    `Implement` carries no per-row category, and
+    `constants.DRAFT_WIDTH_IS_TOOL_COUNT` is a type-wide frozenset (currently
+    empty, matching `tillage_dss (2).html`'s width-in-metres-for-everything
+    behaviour), not a per-implement column. Both are read here only to
+    confirm they exist in the source record; neither is persisted, and
+    neither is silently folded into some other field. `n_units` does have a
+    home (`number_of_tools`) and is mapped there, even though the engine does
+    not currently consult it for any implement type (see that constant).
+    """
+    implement_type = _IMPLEMENT_TYPE_BY_JSON_KEY.get(record["type"])
+    if implement_type is None:
+        return None
+    return dict(
+        name=record["name"],
+        implement_type=implement_type,
+        width=record["W"],
+        weight=record["Wm_kg"],
+        cg_distance_from_hitch=record["Xcgi"],
+        vertical_horizontal_ratio=record["PyD"],
+        asae_param_a=record["A"],
+        asae_param_b=record["B"],
+        asae_param_c=record["C"],
+        number_of_tools=record["n_units"],
+        rotor_pto_power=record["rated_ppto_kw"],
+        rotor_speed=record["rated_rotor_rpm"],
+        rotor_efficiency=record["suggested_eta_r"],
+        rotor_mechanical_resistance=record["suggested_da_n"],
+        is_library=True,
+    )
+
 
 def seed_library_if_empty(db: Session) -> None:
-    """
-    Seed a comprehensive library of tractors and implements for the UI.
+    """Seed the reference library for a fresh (empty-library) database.
 
-    This does NOT touch simulation algorithms; it only inserts default reference data.
+    Only runs when there are zero `is_library=True` rows of a given kind, so
+    it is safe to leave wired into app startup -- it will never touch an
+    existing library, populated by this function or otherwise. For a
+    deliberate full replace of an already-seeded database, see
+    `reseed_library_replace_all` below, which is not called from startup and
+    must be invoked explicitly.
     """
     has_library_tractors = db.query(Tractor).filter(Tractor.is_library == True).first()  # noqa: E712
     has_library_implements = db.query(Implement).filter(Implement.is_library == True).first()  # noqa: E712
@@ -21,749 +176,79 @@ def seed_library_if_empty(db: Session) -> None:
         return
 
     if not has_library_tractors:
-        # Tractors data
-        tractors_data = [
-            {
-                "name": "VST Shakti MT 180D HS/JAI",
-                "manufacturer": "VST Shakti",
-                "model": "MT 180D HS/JAI",
-                "pto_power": 12.0,
-                "rated_engine_speed": 2700,
-                "max_engine_torque": 45.5,
-                "wheelbase": 1.42,
-                "front_axle_weight": 315,
-                "rear_axle_weight": 440,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.59,
-                "rear_wheel_rolling_radius": 0.37585,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "5.2 X 12",
-                    "front_overall_diameter": 513.59,
-                    "front_section_width": 127.0,
-                    "front_static_loaded_radius": 237.74,
-                    "front_rolling_radius": 245.01,
-                    "rear_tire_size": "8 x 18",
-                    "rear_overall_diameter": 789.43,
-                    "rear_section_width": 203.2,
-                    "rear_static_loaded_radius": 364.24,
-                    "rear_rolling_radius": 375.85,
-                },
-            },
-            {
-                "name": "Mahindra & Mahindra B 275 DI",
-                "manufacturer": "Mahindra & Mahindra",
-                "model": "B 275 DI",
-                "pto_power": 25.5,
-                "rated_engine_speed": 2600,
-                "max_engine_torque": 105.2,
-                "wheelbase": 1.83,
-                "front_axle_weight": 710,
-                "rear_axle_weight": 1080,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.73,
-                "rear_wheel_rolling_radius": 0.58391,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "12.4 x 28",
-                    "rear_overall_diameter": 1226.31,
-                    "rear_section_width": 314.96,
-                    "rear_static_loaded_radius": 565.91,
-                    "rear_rolling_radius": 583.91,
-                },
-            },
-            {
-                "name": "PTL 735 FE",
-                "manufacturer": "PTL",
-                "model": "735 FE",
-                "pto_power": 25.3,
-                "rated_engine_speed": 2000,
-                "max_engine_torque": 139.3,
-                "wheelbase": 1.955,
-                "front_axle_weight": 675,
-                "rear_axle_weight": 1110,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.74,
-                "rear_wheel_rolling_radius": 0.58391,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "12.4 x 28",
-                    "rear_overall_diameter": 1226.31,
-                    "rear_section_width": 314.96,
-                    "rear_static_loaded_radius": 565.91,
-                    "rear_rolling_radius": 583.91,
-                },
-            },
-            {
-                "name": "PTL 744 FE",
-                "manufacturer": "PTL",
-                "model": "744 FE",
-                "pto_power": 30.4,
-                "rated_engine_speed": 2000,
-                "max_engine_torque": 165.6,
-                "wheelbase": 1.955,
-                "front_axle_weight": 750,
-                "rear_axle_weight": 1180,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.76,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "PTL 855 FE",
-                "manufacturer": "PTL",
-                "model": "855 FE",
-                "pto_power": 33.0,
-                "rated_engine_speed": 2000,
-                "max_engine_torque": 181.7,
-                "wheelbase": 1.95,
-                "front_axle_weight": 755,
-                "rear_axle_weight": 1160,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.77,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "Eicher 368",
-                "manufacturer": "Eicher",
-                "model": "368",
-                "pto_power": 25.0,
-                "rated_engine_speed": 2150,
-                "max_engine_torque": 132.5,
-                "wheelbase": 1.985,
-                "front_axle_weight": 720,
-                "rear_axle_weight": 1100,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.79,
-                "rear_wheel_rolling_radius": 0.58391,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "12.4 x 28",
-                    "rear_overall_diameter": 1226.31,
-                    "rear_section_width": 314.96,
-                    "rear_static_loaded_radius": 565.91,
-                    "rear_rolling_radius": 583.91,
-                },
-            },
-            {
-                "name": "Eicher 485",
-                "manufacturer": "Eicher",
-                "model": "485",
-                "pto_power": 28.7,
-                "rated_engine_speed": 2150,
-                "max_engine_torque": 148.7,
-                "wheelbase": 2.07,
-                "front_axle_weight": 695,
-                "rear_axle_weight": 1205,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.76,
-                "rear_wheel_rolling_radius": 0.58391,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "12.4 x 28",
-                    "rear_overall_diameter": 1226.31,
-                    "rear_section_width": 314.96,
-                    "rear_static_loaded_radius": 565.91,
-                    "rear_rolling_radius": 583.91,
-                },
-            },
-            {
-                "name": "Farmtrac 45",
-                "manufacturer": "Farmtrac",
-                "model": "45",
-                "pto_power": 27.1,
-                "rated_engine_speed": 2000,
-                "max_engine_torque": 144.1,
-                "wheelbase": 1.944,
-                "front_axle_weight": 760,
-                "rear_axle_weight": 1085,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.8,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "Farmtrac 55",
-                "manufacturer": "Farmtrac",
-                "model": "55",
-                "pto_power": 30.5,
-                "rated_engine_speed": 2000,
-                "max_engine_torque": 157.4,
-                "wheelbase": 1.935,
-                "front_axle_weight": 755,
-                "rear_axle_weight": 1160,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.76,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "TAFE MF 245",
-                "manufacturer": "TAFE",
-                "model": "MF 245",
-                "pto_power": 30.2,
-                "rated_engine_speed": 2250,
-                "max_engine_torque": 157.8,
-                "wheelbase": 1.814,
-                "front_axle_weight": 655,
-                "rear_axle_weight": 1040,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.7,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "TAFE MF 241 DI(J)",
-                "manufacturer": "TAFE",
-                "model": "MF 241 DI(J)",
-                "pto_power": 28.3,
-                "rated_engine_speed": 2000,
-                "max_engine_torque": 156.0,
-                "wheelbase": 1.82,
-                "front_axle_weight": 680,
-                "rear_axle_weight": 1020,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.73,
-                "rear_wheel_rolling_radius": 0.58391,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "12.4 x 28",
-                    "rear_overall_diameter": 1226.31,
-                    "rear_section_width": 314.96,
-                    "rear_static_loaded_radius": 565.91,
-                    "rear_rolling_radius": 583.91,
-                },
-            },
-            {
-                "name": "New Holland 3230 NX",
-                "manufacturer": "New Holland",
-                "model": "3230 NX",
-                "pto_power": 28.6,
-                "rated_engine_speed": 2000,
-                "max_engine_torque": 158.6,
-                "wheelbase": 1.91,
-                "front_axle_weight": 680,
-                "rear_axle_weight": 1000,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.77,
-                "rear_wheel_rolling_radius": 0.58391,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "12.4 x 28",
-                    "rear_overall_diameter": 1226.31,
-                    "rear_section_width": 314.96,
-                    "rear_static_loaded_radius": 565.91,
-                    "rear_rolling_radius": 583.91,
-                },
-            },
-            {
-                "name": "New Holland 3630 TX",
-                "manufacturer": "New Holland",
-                "model": "3630 TX",
-                "pto_power": 33.8,
-                "rated_engine_speed": 2500,
-                "max_engine_torque": 141.7,
-                "wheelbase": 2.065,
-                "front_axle_weight": 840,
-                "rear_axle_weight": 1250,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.83,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "Sonalika 750 DI",
-                "manufacturer": "Sonalika",
-                "model": "750 DI",
-                "pto_power": 28.9,
-                "rated_engine_speed": 2250,
-                "max_engine_torque": 140.6,
-                "wheelbase": 1.94,
-                "front_axle_weight": 790,
-                "rear_axle_weight": 1180,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.78,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "Sonalika 750 DI III",
-                "manufacturer": "Sonalika",
-                "model": "750 DI III",
-                "pto_power": 31.3,
-                "rated_engine_speed": 2100,
-                "max_engine_torque": 155.9,
-                "wheelbase": 2.065,
-                "front_axle_weight": 925,
-                "rear_axle_weight": 1205,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.9,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "Sonalika DI 55",
-                "manufacturer": "Sonalika",
-                "model": "DI 55",
-                "pto_power": 36.6,
-                "rated_engine_speed": 2100,
-                "max_engine_torque": 185.5,
-                "wheelbase": 2.085,
-                "front_axle_weight": 930,
-                "rear_axle_weight": 1205,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.91,
-                "rear_wheel_rolling_radius": 0.60388,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6 x 16",
-                    "front_overall_diameter": 659.38,
-                    "front_section_width": 152.4,
-                    "front_static_loaded_radius": 306.83,
-                    "front_rolling_radius": 315.58,
-                    "rear_tire_size": "13.6 x 28",
-                    "rear_overall_diameter": 1272.03,
-                    "rear_section_width": 345.44,
-                    "rear_static_loaded_radius": 584.2,
-                    "rear_rolling_radius": 603.88,
-                },
-            },
-            {
-                "name": "Johndeere 5310",
-                "manufacturer": "John Deere",
-                "model": "5310",
-                "pto_power": 37.4,
-                "rated_engine_speed": 2400,
-                "max_engine_torque": 178.0,
-                "wheelbase": 2.05,
-                "front_axle_weight": 755,
-                "rear_axle_weight": 1400,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.72,
-                "rear_wheel_rolling_radius": 0.65877,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "6.5 x 20",
-                    "front_overall_diameter": 786.13,
-                    "front_section_width": 165.1,
-                    "front_static_loaded_radius": 368.3,
-                    "front_rolling_radius": 377.82,
-                    "rear_tire_size": "16.9 x 28",
-                    "rear_overall_diameter": 1397.76,
-                    "rear_section_width": 429.26,
-                    "rear_static_loaded_radius": 634.49,
-                    "rear_rolling_radius": 658.77,
-                },
-            },
-            {
-                "name": "New Holland 6010",
-                "manufacturer": "New Holland",
-                "model": "6010",
-                "pto_power": 39.0,
-                "rated_engine_speed": 2300,
-                "max_engine_torque": 236.93,
-                "wheelbase": 2.075,
-                "front_axle_weight": 965,
-                "rear_axle_weight": 1615,
-                "hitch_distance_from_rear": 0.72,
-                "cg_distance_from_rear": 0.775,
-                "rear_wheel_rolling_radius": 0.65877,
-                "tire": {
-                    "tire_type": TireType.BIAS_PLY,
-                    "front_tire_size": "7.5 x 16",
-                    "front_overall_diameter": 716.53,
-                    "front_section_width": 190.5,
-                    "front_static_loaded_radius": 329.69,
-                    "front_rolling_radius": 340.56,
-                    "rear_tire_size": "16.9 x 28",
-                    "rear_overall_diameter": 1397.76,
-                    "rear_section_width": 429.26,
-                    "rear_static_loaded_radius": 634.49,
-                    "rear_rolling_radius": 658.77,
-                },
-            },
-        ]
-
-        # Add all tractors
-        for tractor_data in tractors_data:
-            tire_data = tractor_data.pop("tire", None)
-            tractor = Tractor(
-                **tractor_data,
-                drive_mode=DriveMode.WD2,
-                transmission_efficiency=86.0,
-                power_reserve=20.0,
-                is_library=True,
-            )
+        for record in _load_json("seed_tractors.json"):
+            tractor_kwargs, tire_kwargs = _tractor_kwargs_from_json(record)
+            tractor = Tractor(**tractor_kwargs)
             db.add(tractor)
             db.flush()
-
-            # Add tire specification if provided
-            if tire_data:
-                db.add(TireSpecification(tractor_id=tractor.id, **tire_data))
+            db.add(TireSpecification(tractor_id=tractor.id, **tire_kwargs))
 
     if not has_library_implements:
-        # Implements data
-        implements_data = [
-            {
-                "name": "2-Bottom MB Plough",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.MB_PLOUGH,
-                "width": 0.6,
-                "weight": 280,
-                "cg_distance_from_hitch": 0.55,
-                "vertical_horizontal_ratio": 0.2,
-                "asae_param_a": 652,
-                "asae_param_b": 0,
-                "asae_param_c": 5.1,
-            },
-            {
-                "name": "3-Bottom MB Plough",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.MB_PLOUGH,
-                "width": 0.9,
-                "weight": 380,
-                "cg_distance_from_hitch": 0.7,
-                "vertical_horizontal_ratio": 0.2,
-                "asae_param_a": 652,
-                "asae_param_b": 0,
-                "asae_param_c": 5.1,
-            },
-            {
-                "name": "4-Bottom MB Plough",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.MB_PLOUGH,
-                "width": 1.2,
-                "weight": 500,
-                "cg_distance_from_hitch": 0.5,
-                "vertical_horizontal_ratio": 0.2,
-                "asae_param_a": 652,
-                "asae_param_b": 0,
-                "asae_param_c": 5.1,
-            },
-            {
-                "name": "5-Bottom MB Plough",
-                "manufacturer": "Heavy Duty",
-                "implement_type": ImplementType.MB_PLOUGH,
-                "width": 1.5,
-                "weight": 620,
-                "cg_distance_from_hitch": 0.55,
-                "vertical_horizontal_ratio": 0.2,
-                "asae_param_a": 652,
-                "asae_param_b": 0,
-                "asae_param_c": 5.1,
-            },
-            {
-                "name": "2-Disc Plough",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.DISC_PLOUGH,
-                "width": 0.8,
-                "weight": 320,
-                "cg_distance_from_hitch": 0.5,
-                "vertical_horizontal_ratio": 0.0,
-                "asae_param_a": 124,
-                "asae_param_b": 6.4,
-                "asae_param_c": 0,
-            },
-            {
-                "name": "3-Disc Plough",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.DISC_PLOUGH,
-                "width": 1.2,
-                "weight": 450,
-                "cg_distance_from_hitch": 0.65,
-                "vertical_horizontal_ratio": 0.0,
-                "asae_param_a": 124,
-                "asae_param_b": 6.4,
-                "asae_param_c": 0,
-            },
-            {
-                "name": "4-Disc Plough",
-                "manufacturer": "Heavy Duty",
-                "implement_type": ImplementType.DISC_PLOUGH,
-                "width": 1.6,
-                "weight": 580,
-                "cg_distance_from_hitch": 0.52,
-                "vertical_horizontal_ratio": 0.0,
-                "asae_param_a": 124,
-                "asae_param_b": 6.4,
-                "asae_param_c": 0,
-            },
-            {
-                "name": "Light Cultivator (9 Tines)",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.CULTIVATOR,
-                "width": 2.2,
-                "weight": 180,
-                "cg_distance_from_hitch": 0.46,
-                "vertical_horizontal_ratio": 0.2,
-                "asae_param_a": 32,
-                "asae_param_b": 1.9,
-                "asae_param_c": 0,
-                "number_of_tools": 9,
-            },
-            {
-                "name": "Medium Cultivator (13 Tines)",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.CULTIVATOR,
-                "width": 3.13,
-                "weight": 280,
-                "cg_distance_from_hitch": 0.46,
-                "vertical_horizontal_ratio": 0.2,
-                "asae_param_a": 32,
-                "asae_param_b": 1.9,
-                "asae_param_c": 0,
-                "number_of_tools": 13,
-            },
-            {
-                "name": "Heavy Cultivator (17 Tines)",
-                "manufacturer": "Heavy Duty",
-                "implement_type": ImplementType.CULTIVATOR,
-                "width": 4.15,
-                "weight": 420,
-                "cg_distance_from_hitch": 0.46,
-                "vertical_horizontal_ratio": 0.2,
-                "asae_param_a": 32,
-                "asae_param_b": 1.9,
-                "asae_param_c": 0,
-                "number_of_tools": 17,
-            },
-            {
-                "name": "Light Disc Harrow (16 Discs)",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.DISC_HARROW,
-                "width": 1.5,
-                "weight": 220,
-                "cg_distance_from_hitch": 0.65,
-                "vertical_horizontal_ratio": 0.0,
-                "asae_param_a": 254,
-                "asae_param_b": 13.2,
-                "asae_param_c": 0,
-            },
-            {
-                "name": "Medium Disc Harrow (24 Discs)",
-                "manufacturer": "Standard",
-                "implement_type": ImplementType.DISC_HARROW,
-                "width": 2,
-                "weight": 340,
-                "cg_distance_from_hitch": 0.65,
-                "vertical_horizontal_ratio": 0.0,
-                "asae_param_a": 254,
-                "asae_param_b": 13.2,
-                "asae_param_c": 0,
-            },
-            {
-                "name": "Heavy Disc Harrow (32 Discs)",
-                "manufacturer": "Heavy Duty",
-                "implement_type": ImplementType.DISC_HARROW,
-                "width": 2.8,
-                "weight": 520,
-                "cg_distance_from_hitch": 0.65,
-                "vertical_horizontal_ratio": 0.0,
-                "asae_param_a": 254,
-                "asae_param_b": 13.2,
-                "asae_param_c": 0,
-            },
-            *ACTIVE_LIBRARY_IMPLEMENTS,
-        ]
-
-        # Add all implements
-        for implement_data in implements_data:
-            implement = Implement(**implement_data, is_library=True)
-            db.add(implement)
+        for record in _load_json("seed_implements.json"):
+            kwargs = _implement_kwargs_from_json(record)
+            if kwargs is None:
+                continue  # power_harrow -- no ImplementType member; see module docstring
+            db.add(Implement(**kwargs))
 
     db.commit()
 
 
-# --- Active (PTO-powered) library implements ---------------------------------
-# These occupy the rotor slot of an active-passive combination. They carry NO
-# ASAE draft parameters by design: the DSS active-passive model derives the
-# rotor's contribution from its own specs (Da, eta_r, P_PTO, N), never from the
-# passive draft equation.
-#
-# NOTE: like the passive A/B/C values above, these rotor specs are
-# REPRESENTATIVE PLACEHOLDER catalogue data for demo purposes, not
-# manufacturer-published figures. Calibrate against real equipment data sheets
-# before relying on absolute results.
-ACTIVE_LIBRARY_IMPLEMENTS = [
-    {
-        "name": "Rotavator (5 ft)",
-        "manufacturer": "Standard",
-        "implement_type": ImplementType.ROTAVATOR,
-        "width": 1.5,
-        "weight": 380,
-        "cg_distance_from_hitch": 0.45,
-        "rotor_mechanical_resistance": 300,
-        "rotor_efficiency": 0.30,
-        "rotor_pto_power": 3.0,
-        "rotor_speed": 540,
-    },
-    {
-        "name": "Rotavator (7 ft)",
-        "manufacturer": "Heavy Duty",
-        "implement_type": ImplementType.ROTAVATOR,
-        "width": 2.1,
-        "weight": 520,
-        "cg_distance_from_hitch": 0.5,
-        "rotor_mechanical_resistance": 420,
-        "rotor_efficiency": 0.32,
-        "rotor_pto_power": 4.5,
-        "rotor_speed": 540,
-    },
-    {
-        "name": "Powered Disc Harrow (20 Discs)",
-        "manufacturer": "Standard",
-        "implement_type": ImplementType.DISC_HARROW_POWERED,
-        "width": 1.8,
-        "weight": 410,
-        "cg_distance_from_hitch": 0.44,
-        "rotor_mechanical_resistance": 350,
-        "rotor_efficiency": 0.28,
-        "rotor_pto_power": 3.5,
-        "rotor_speed": 540,
-    },
-    {
-        "name": "Powered Cultivator (11 Tines)",
-        "manufacturer": "Standard",
-        "implement_type": ImplementType.CULTIVATOR_POWERED,
-        "width": 1.6,
-        "weight": 330,
-        "cg_distance_from_hitch": 0.4,
-        "rotor_mechanical_resistance": 280,
-        "rotor_efficiency": 0.27,
-        "rotor_pto_power": 3.0,
-        "rotor_speed": 540,
-    },
-]
+def reseed_library_replace_all(db: Session) -> "dict[str, Any]":
+    """Delete every existing `is_library=True` tractor/implement and reinsert
+    the full `seed_data/*.json` dataset. **Not called automatically anywhere**
+    -- unlike `seed_library_if_empty`, this is destructive and must be invoked
+    explicitly (e.g. from a one-off script or shell) when a full reset is
+    genuinely intended.
 
+    *** Read before calling this against a database with real usage. ***
+    `Simulation.tractor_id` / `Simulation.implement_id` both have
+    `ondelete="CASCADE"`: deleting a library tractor or implement that any
+    `Simulation` references **permanently deletes that Simulation too**.
+    `OperationSession.implement_id` has `ondelete="SET NULL"` (a session
+    survives, losing its implement link); `OperationSession.tractor_id` has
+    `ondelete="RESTRICT"` (the delete is refused outright if any session still
+    references that tractor).
 
-# Existing installations receive these via the idempotent top-up in migration
-# i4j5k6l7m8n9 (seed_library_if_empty only fires on a database with zero
-# library implements, so it would never reach them).
+    Check first, e.g.:
 
+        SELECT count(*) FROM simulations s
+          JOIN tractors t ON s.tractor_id = t.id WHERE t.is_library = true;
+        SELECT count(*) FROM simulations s
+          JOIN implements i ON s.implement_id = i.id WHERE i.is_library = true;
+
+    Call this only once that count is zero, or the resulting loss is
+    genuinely acceptable.
+
+    Returns a report: how many tractors/implements were inserted, and the
+    names of any implement records skipped for lacking a matching
+    `ImplementType` (see the module docstring).
+    """
+    db.query(Implement).filter(Implement.is_library == True).delete(synchronize_session=False)  # noqa: E712
+    db.query(Tractor).filter(Tractor.is_library == True).delete(synchronize_session=False)  # noqa: E712
+    db.flush()
+
+    tractor_records = _load_json("seed_tractors.json")
+    for record in tractor_records:
+        tractor_kwargs, tire_kwargs = _tractor_kwargs_from_json(record)
+        tractor = Tractor(**tractor_kwargs)
+        db.add(tractor)
+        db.flush()
+        db.add(TireSpecification(tractor_id=tractor.id, **tire_kwargs))
+
+    implement_records = _load_json("seed_implements.json")
+    inserted_implements = 0
+    skipped_implements: list[str] = []
+    for record in implement_records:
+        kwargs = _implement_kwargs_from_json(record)
+        if kwargs is None:
+            skipped_implements.append(record["name"])
+            continue
+        db.add(Implement(**kwargs))
+        inserted_implements += 1
+
+    db.commit()
+    return {
+        "tractors_inserted": len(tractor_records),
+        "implements_inserted": inserted_implements,
+        "implements_skipped": skipped_implements,
+    }

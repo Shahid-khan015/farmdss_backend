@@ -96,10 +96,11 @@ def _human_param_label(parameter_name: str) -> str:
     return parameter_name.replace("_", " ").title()
 
 
-def _evaluate_threshold(reading: IoTReading, db: Session) -> None:
+def _evaluate_threshold(reading: IoTReading, db: Session) -> Optional[IoTAlert]:
+    """Returns the alert raised, or None. See `evaluate` for why it is returned."""
     status_label = get_status_label(reading.feed_key, reading.numeric_value)
     if status_label not in ("warning", "critical"):
-        return
+        return None
 
     threshold_ref: Optional[float] = None
     if reading.feed_key == "gearbox_temperature":
@@ -140,33 +141,39 @@ def _evaluate_threshold(reading: IoTReading, db: Session) -> None:
         IoTAlert.alert_type == "threshold",
         IoTAlert.acknowledged == False,  # noqa: E712
     ).first()
-    if existing_threshold is None:
-        severity_text = "critically high" if status_label == "critical" else "warning"
-        if reading.feed_key == "soil_moisture":
-            severity_text = "critically low" if status_label == "critical" else "warning"
-        value_text = f"{reading.numeric_value:g}" if reading.numeric_value is not None else "n/a"
-        threshold_text = f"{threshold_ref:g}" if threshold_ref is not None else "n/a"
-        msg = f"{label} {severity_text}: {value_text}{unit} (threshold: {threshold_text}{unit})"
-        db.add(
-            IoTAlert(
-                session_id=reading.session_id,
-                reading_id=reading.id,
-                feed_key=reading.feed_key,
-                alert_type="threshold",
-                alert_status=status_label,
-                actual_value=reading.numeric_value,
-                reference_value=threshold_ref,
-                message=msg,
-            )
-        )
-        db.flush()
+    if existing_threshold is not None:
+        # An open, unacknowledged alert for this feed already stands.
+        return None
+
+    severity_text = "critically high" if status_label == "critical" else "warning"
+    if reading.feed_key == "soil_moisture":
+        severity_text = "critically low" if status_label == "critical" else "warning"
+    value_text = f"{reading.numeric_value:g}" if reading.numeric_value is not None else "n/a"
+    threshold_text = f"{threshold_ref:g}" if threshold_ref is not None else "n/a"
+    msg = f"{label} {severity_text}: {value_text}{unit} (threshold: {threshold_text}{unit})"
+    created = IoTAlert(
+        session_id=reading.session_id,
+        reading_id=reading.id,
+        feed_key=reading.feed_key,
+        alert_type="threshold",
+        alert_status=status_label,
+        actual_value=reading.numeric_value,
+        reference_value=threshold_ref,
+        message=msg,
+    )
+    db.add(created)
+    db.flush()
+    return created
 
 
-def _evaluate_preset_deviation(reading: IoTReading, db: Session, preset: SessionPresetValue) -> None:
+def _evaluate_preset_deviation(
+    reading: IoTReading, db: Session, preset: SessionPresetValue
+) -> Optional[IoTAlert]:
+    """Returns the alert raised or updated, or None. See `evaluate`."""
     if reading.numeric_value is None:
-        return
+        return None
     if preset.required_value is None:
-        return
+        return None
 
     parameter_name = preset.parameter_name
     actual = float(reading.numeric_value)
@@ -174,14 +181,14 @@ def _evaluate_preset_deviation(reading: IoTReading, db: Session, preset: Session
 
     deviation_pct, should_eval = _preset_deviation_pct(actual, target, parameter_name)
     if not should_eval or deviation_pct is None:
-        return
+        return None
 
     if deviation_pct >= float(preset.deviation_pct_crit):
         deviation_status = "critical"
     elif deviation_pct >= float(preset.deviation_pct_warn):
         deviation_status = "warning"
     else:
-        return
+        return None
 
     label = _human_param_label(parameter_name)
     unit = preset.unit or ""
@@ -212,27 +219,33 @@ def _evaluate_preset_deviation(reading: IoTReading, db: Session, preset: Session
         existing.message = msg
         existing.reading_id = reading.id
         db.flush()
-        return
+        return existing
 
-    db.add(
-        IoTAlert(
-            session_id=reading.session_id,
-            reading_id=reading.id,
-            feed_key=reading.feed_key,
-            alert_type="deviation",
-            alert_status=deviation_status,
-            actual_value=actual,
-            reference_value=target,
-            message=msg,
-        )
+    created = IoTAlert(
+        session_id=reading.session_id,
+        reading_id=reading.id,
+        feed_key=reading.feed_key,
+        alert_type="deviation",
+        alert_status=deviation_status,
+        actual_value=actual,
+        reference_value=target,
+        message=msg,
     )
+    db.add(created)
     db.flush()
+    return created
 
 
-def evaluate(reading: IoTReading, db: Session) -> None:
+def evaluate(reading: IoTReading, db: Session) -> Optional[IoTAlert]:
+    """Evaluate one reading and return the alert it raised or updated, if any.
+
+    The return value exists so the caller can broadcast the alert **after** its
+    transaction commits. Alerts are added inside this function, before the commit;
+    publishing here would show a client an alert a failed commit then discards.
+    """
     try:
         if reading.session_id is None:
-            return
+            return None
 
         parameter_name = FEED_TO_PARAMETER.get(reading.feed_key)
         owner_preset: Optional[SessionPresetValue] = None
@@ -254,9 +267,8 @@ def evaluate(reading: IoTReading, db: Session) -> None:
 
         # Owner/implement presets on the session take precedence over generic thresholds
         if has_owner_target:
-            _evaluate_preset_deviation(reading, db, owner_preset)
-        else:
-            _evaluate_threshold(reading, db)
+            return _evaluate_preset_deviation(reading, db, owner_preset)
+        return _evaluate_threshold(reading, db)
 
     except Exception as exc:  # pragma: no cover - defensive pipeline guard
         logger.exception(
@@ -264,3 +276,4 @@ def evaluate(reading: IoTReading, db: Session) -> None:
             getattr(reading, "id", None),
             exc,
         )
+        return None

@@ -122,6 +122,12 @@ class LegacyInputs:
     #: classes (see `constants.DRAFT_WIDTH_IS_TOOL_COUNT`); ignored for the rest.
     number_of_tools: Optional[int] = None
 
+    #: Rated PTO draw of a PTO-powered implement, kW. Required only when such an
+    #: implement is run *standalone* -- see `calculate_standalone_active_performance`.
+    rotor_pto_power_kw: Optional[float] = None
+    #: Rated rotor shaft speed, rpm. Reported, not used in the standalone path.
+    rotor_speed_rpm: Optional[float] = None
+
 
 def _passive_only_lookup_error(implement_type: ImplementType, table_name: str) -> ValueError:
     """Both tables are defined only for passive tools -- see DSS Eq. 3.1 / Section 3.3.
@@ -141,15 +147,23 @@ def fi_factor(implement_type: ImplementType, soil_texture: SoilTexture) -> float
     """Dimensionless soil-texture adjustment parameter F (DSS Eq. 3.1).
 
     [REFERENCE-ALIGNED] One value per soil texture, applied to every implement --
-    see constants.FI_FACTOR_BY_TEXTURE for the provenance and for the known
-    departure from D497's per-implement F rows.
+    **reverted** to match `docs/tillage_dss (2).html`'s engine exactly, whose
+    `readCommonInputs` reads Fi from a single texture selector
+    (`fi: parseFloat(...)`) with no implement dimension at all.
 
-    `implement_type` no longer selects the value; it is validated only. The DSS
-    passive-draft model is defined solely for unpowered tools, and that guard
-    used to fall out of the per-implement table having no rows for active types.
-    A global table has no such row to be missing, so the check is explicit here
-    -- without it, routing a rotor through Eq. 3.1 would silently succeed and
-    model a PTO-powered implement as if it were unpowered.
+    A per-implement table (ASABE D497 Table 1: disc tools 1.0/0.88/0.78, cultivators
+    1.0/0.85/0.65) was reinstated for one session -- independently corroborated by the
+    2006 VB6 original this DSS derives from -- and is still available as
+    `constants.FI_FACTOR_BY_IMPLEMENT_TYPE`, unused by this function now. Reverting
+    understates draft on every disc/cultivator implement in non-fine soil again
+    (measured: disc harrow in coarse soil, draft back down 1.73x). See that
+    constant's docstring, and `constants.FI_FACTOR_BY_TEXTURE`'s, for the full
+    provenance either way.
+
+    `implement_type` is still validated, though it no longer selects the value: the
+    DSS passive-draft model is defined solely for unpowered tools, and this raises
+    for the rest -- without it, routing a rotor through Eq. 3.1 would silently
+    succeed and model a PTO-powered implement as if it were unpowered.
     """
     if not is_passive(implement_type):
         raise _passive_only_lookup_error(implement_type, "Fi soil-texture factor")
@@ -193,23 +207,19 @@ def draft_width_parameter(
     width_m: float,
     number_of_tools: Optional[int] = None,
 ) -> float:
-    """Eq. 3.1's `W`: working width in m, or the tool count for per-tool rows.
+    """Eq. 3.1's `W`: working width in m for every implement.
 
-    See `constants.DRAFT_WIDTH_IS_TOOL_COUNT` for why the unit differs by
-    implement class. Only Eq. 3.1 uses this -- field capacity, turning time and
-    swath always take the width in metres.
+    See `constants.DRAFT_WIDTH_IS_TOOL_COUNT` -- now kept empty deliberately, to
+    match `docs/tillage_dss (2).html`'s engine, which has no tool-count concept at
+    all. Only Eq. 3.1 uses this -- field capacity, turning time and swath always
+    take the width in metres regardless.
 
-    A missing `number_of_tools` on a per-tool implement RAISES; it does not fall
-    back to the width in metres. An earlier revision did fall back, so that rows
-    predating the column would keep running -- but the result is not merely
-    understated, it is meaningless. For a 9-tine cultivator behind a rotavator at
-    12 cm / 4 km/h the substitution takes draft from 2759 N to 12.6 N (219x low),
-    because in active-passive the understated passive draft is very nearly
-    cancelled by the rotor's forward thrust (`Deff = Dp + Da - Ta`). The run then
-    *succeeds* and reports a plausible "Underloaded" verdict built on ~zero draft.
-
-    A refused answer beats a wrong one that looks right. The API maps ValueError
-    to a 422, so callers get an actionable message naming the field.
+    The tool-count path below is unreachable with an empty
+    `DRAFT_WIDTH_IS_TOOL_COUNT`, but is left in place rather than deleted: it is a
+    one-line revert (repopulate that frozenset) back to per-tool fidelity for
+    implement classes ASABE D497 Table 1 tabulates per tool rather than per metre,
+    should HTML parity ever stop being the goal. See that constant's docstring for
+    the size of what per-tool fidelity was worth.
     """
     if implement_type.value not in DRAFT_WIDTH_IS_TOOL_COUNT:
         return width_m
@@ -912,7 +922,129 @@ def resolve_axle_loads(
     return AxleLoadResolution(rd_n, fd_n, ballast_kg, True)
 
 
+def calculate_standalone_active_performance(inputs: LegacyInputs) -> dict:
+    """A PTO-powered implement (rotavator, power harrow) used on its own.
+
+    There is no towed passive draft to model: these implements are rigidly
+    three-point mounted and the library deliberately carries no A/B/C for them, so
+    Eq. 3.1's whole chain -- draft, axle loads, wheel numeric, slip, mu, tractive
+    efficiency, ballast -- has nothing to compute. Rather than fabricate zeros,
+    every one of those is returned as **None** so the API and UI render an em-dash.
+
+    What *is* knowable is computed: field capacity from width and speed, and the
+    power/fuel chain driven directly by the implement's own rated PTO draw on the
+    same PTO fuel basis the towed modes use.
+
+    Previously this raised outright ("the DSS passive-draft model is defined only
+    for unpowered tools"), which is true of Eq. 3.1 but was over-applied: it also
+    refused the one configuration where Eq. 3.1 is simply not needed.
+    """
+    require_positive("implement width", inputs.width_m)
+    require_positive("operating speed", inputs.speed_kmh)
+    require_positive("field area", inputs.field_area_ha)
+    require_positive("rated PTO power", inputs.pto_power_kw)
+
+    ppto_kw = inputs.rotor_pto_power_kw
+    if ppto_kw is None or ppto_kw <= 0:
+        raise ValueError(
+            "A standalone PTO-powered implement needs its rated PTO power draw "
+            "(rotor_pto_power_kw). Set it on the implement record, or run the "
+            "implement as the rotor of an active-passive combination instead."
+        )
+
+    capacity = field_capacity(
+        speed_kmh=inputs.speed_kmh,
+        width_m=inputs.width_m,
+        field_area_ha=inputs.field_area_ha,
+        field_width_m=inputs.field_width_m,
+    )
+
+    power_reserve_frac = inputs.power_reserve_pct / 100.0
+    if power_reserve_frac >= 1.0:
+        raise ValueError(
+            "Invalid power reserve: must be below 100%, got {0!r}%".format(inputs.power_reserve_pct)
+        )
+    put_pct = safe_div(
+        "power utilization", ppto_kw, inputs.pto_power_kw * (1.0 - power_reserve_frac)
+    ) * 100.0
+    x_fraction = safe_div("PTO power fraction", ppto_kw, inputs.pto_power_kw)
+    sfc = specific_fuel_consumption_l_per_kwh(x_fraction)
+    fuel_lph = sfc * ppto_kw
+    fuel_l_per_ha = max(0.0, safe_div("fuel consumption per hectare", fuel_lph, capacity.fc_ac))
+
+    # Table 4.2 skips any condition whose input is None, so only the Put rule can
+    # fire here -- there is no slip, no mu and no Kwef to judge.
+    envelope = result_envelope(
+        slip=None,
+        net_traction_coefficient=None,
+        front_weight_utilization=None,
+        fi=None,
+        put_pct=put_pct,
+        field_eff_pct=capacity.field_eff_pct,
+        converged=True,
+    )
+
+    return {
+        "calculation_mode": "dss_spec_v1_standalone_active",
+        "is_standalone_active_implement": True,
+        # Not applicable -- deliberately None, never 0.0.
+        "draft_force": None,
+        "drawbar_power": None,
+        "slip": None,
+        "coefficient_net_traction": None,
+        "traction_efficiency": None,
+        "legacy_front_axle_load_n": None,
+        "legacy_rear_axle_load_n": None,
+        "legacy_mobility_number_rear": None,
+        "legacy_mobility_number_front": None,
+        "legacy_gross_traction_ratio": None,
+        "front_weight_utilization": None,
+        "rear_weight_utilization": None,
+        "ballast_front_required": None,
+        "ballast_rear_required": None,
+        "converged": None,
+        # Knowable.
+        "rotor_pto_power": ppto_kw,
+        "rotor_speed_rpm": inputs.rotor_speed_rpm,
+        "required_pto_power": ppto_kw,
+        "power_utilization": put_pct,
+        "pto_power_fraction_effective": x_fraction,
+        "specific_fuel_consumption": sfc,
+        "fuel_l_per_hour": fuel_lph,
+        "fuel_basis": "pto",
+        "fuel_l_per_hour_pto_basis": fuel_lph,
+        # No drawbar power exists, so there is no drawbar fuel reading to report.
+        "fuel_l_per_hour_drawbar_basis": None,
+        "fuel_consumption_per_hectare": fuel_l_per_ha,
+        "overall_efficiency": None,
+        "field_capacity_theoretical": capacity.fc_th,
+        "field_capacity_actual": capacity.fc_ac,
+        "field_efficiency": capacity.field_eff_pct,
+        "legacy_field_efficiency_raw": capacity.field_eff_raw_pct,
+        "legacy_turning_time_seconds": capacity.turning_time_s,
+        "legacy_number_of_turns": capacity.number_turns,
+        "total_time_hours": capacity.total_time_h,
+        "headland_turning_time_hours": capacity.total_turning_time_h,
+        "headland_turning_time_single_pass_basis_hours": capacity.turning_time_single_pass_basis_h,
+        "load_status": envelope.load_status,
+        "recommendations": envelope.recommendations,
+        "recommendation_messages": envelope.recommendation_messages,
+        "status": envelope.status,
+        "status_message": envelope.status_message,
+        "confidence": envelope.confidence,
+        "warnings": [
+            "Standalone PTO-powered implement: draft, axle loads, traction, slip and "
+            "ballast are not applicable and are reported as null."
+        ],
+    }
+
+
 def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
+    # A PTO-powered implement on its own has no passive draft chain; route it to
+    # the standalone path rather than failing in fi_factor.
+    if not is_passive(inputs.implement_type):
+        return calculate_standalone_active_performance(inputs)
+
     require_positive("implement width", inputs.width_m)
     require_positive("operating speed", inputs.speed_kmh)
     require_positive("field area", inputs.field_area_ha)
@@ -1069,11 +1201,14 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
     fuel_cons_l_per_ha = power.fuel_l_per_ha
     overall_pct = power.overall_pct
 
+    # `fi` (Eq. 3.1's draft Fi) is texture-only again now that fi_factor() is
+    # reverted, so it's also exactly Table 4.2's soil-condition reading -- no
+    # separate variable needed, unlike the per-implement-Fi revision this undoes.
     envelope = result_envelope(
         slip=slip,
-        draft_n=draft_n,
-        te_pct=te_pct,
-        fuel_l_per_ha=fuel_cons_l_per_ha,
+        net_traction_coefficient=mu,
+        front_weight_utilization=kwf,
+        fi=fi,
         put_pct=pused_pct,
         field_eff_pct=field_eff_pct,
         converged=converged,
@@ -1128,7 +1263,13 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         "converged": converged,
         "engine_torque_limited_pull": pet_n,
         "fuel_l_per_hour": power.fuel_lph,
+        # Which power the fuel figure is billed against. Explicit so a consumer
+        # never has to infer it -- this basis changed once already.
+        "fuel_basis": power.fuel_basis,
         "fuel_l_per_hour_pto_basis": power.fuel_lph_pto_basis,
+        # Diagnostic: the spreadsheet's SFC x DBp basis, kept so a run stays
+        # reconcilable cell-for-cell against the workbook. Feeds nothing.
+        "fuel_l_per_hour_drawbar_basis": power.fuel_lph_drawbar_basis,
         "legacy_field_efficiency_raw": capacity.field_eff_raw_pct,
         # Diagnostics only. The headland time actually used carries an undocumented
         # factor of 2 that the spreadsheet's C71 does not have; both bases are
@@ -1136,6 +1277,9 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
         "headland_turning_time_hours": capacity.total_turning_time_h,
         "headland_turning_time_single_pass_basis_hours": capacity.turning_time_single_pass_basis_h,
         "legacy_fi": fi,
+        # Correctly-spelled key. `legacypy_over_d_ratio` (missing underscore) is
+        # retained alongside it for one release so existing consumers keep working.
+        "legacy_py_over_d_ratio": py_over_d,
         "legacypy_over_d_ratio": py_over_d,
         "legacy_turning_time_seconds": turning_time_s,
         "legacy_number_of_turns": number_turns,
@@ -1159,6 +1303,11 @@ def calculate_legacy_performance(inputs: LegacyInputs) -> dict:
             mu, mu_g, slip / 100.0
         ),
         "slip_stepped": slip_solution.stepped_slip_pct,
+        # The solver schedule, reported so a non-converged run is self-explaining:
+        # the cap is where the search gave up, not a predicted operating slip.
+        "slip_assumed_start_pct": SLIP_INITIAL_PCT,
+        "slip_limit_pct": MAX_SLIP_PCT,
+        "slip_hit_limit": not slip_solution.converged,
         # Front ballast fitted to keep a front-lifting combination answerable.
         # Non-zero means the figures above are conditional on carrying it.
         "stabilising_front_ballast_kg": axles.stabilising_ballast_kg,

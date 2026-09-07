@@ -22,8 +22,75 @@ ATTACHABLE_SESSION_STATUSES = ("active", "paused")
 
 
 def broadcast_update(reading: IoTReading) -> None:
-    """Future: WebSocket fan-out to dashboards; keep as no-op until socket layer exists."""
-    _ = reading
+    """Push one stored reading to any WebSocket watching its session.
+
+    Called only **after** the row is committed -- publishing a pre-commit row would show
+    a client data that a failed commit then discards.
+
+    The payload deliberately mirrors the frontend's `FeedReading` shape so a socket frame
+    can be dropped straight into the same state the `/iot/latest` poll fills, which is
+    what lets the client fall back to polling without a second code path.
+
+    Imported lazily and guarded: fan-out is a display convenience and must never be able
+    to fail an ingest.
+    """
+    if reading.session_id is None:
+        return
+    try:
+        from app.services.alert_engine import get_status_label
+        from app.services.live_hub import HUB
+
+        HUB.publish_threadsafe(
+            str(reading.session_id),
+            {
+                "type": "reading",
+                "feed_key": reading.feed_key,
+                "raw_value": reading.raw_value,
+                "numeric_value": reading.numeric_value,
+                "unit": reading.unit,
+                "device_timestamp": (
+                    reading.device_timestamp.isoformat()
+                    if reading.device_timestamp is not None
+                    else None
+                ),
+                "lat": reading.latitude,
+                "lon": reading.longitude,
+                "status_label": get_status_label(reading.feed_key, reading.numeric_value),
+            },
+        )
+    except Exception:
+        logger.exception("broadcast_update failed for reading %s", getattr(reading, "id", None))
+
+
+def broadcast_alert(alert: "IoTAlert") -> None:
+    """Push one alert to any WebSocket watching its session.
+
+    Lets the client retire its 8-second `/alerts` poll. Same guarantees as
+    `broadcast_update`: post-commit, lazily imported, never raises.
+    """
+    if alert.session_id is None:
+        return
+    try:
+        from app.services.live_hub import HUB
+
+        HUB.publish_threadsafe(
+            str(alert.session_id),
+            {
+                "type": "alert",
+                "id": str(alert.id),
+                "feed_key": alert.feed_key,
+                "alert_type": alert.alert_type,
+                "alert_status": alert.alert_status,
+                "severity_color": "red" if alert.alert_status == "critical" else "orange",
+                "actual_value": alert.actual_value,
+                "reference_value": alert.reference_value,
+                "message": alert.message,
+                "acknowledged": bool(alert.acknowledged),
+                "created_at": alert.created_at.isoformat() if alert.created_at else None,
+            },
+        )
+    except Exception:
+        logger.exception("broadcast_alert failed for alert %s", getattr(alert, "id", None))
 
 
 def resolve_target_session(
@@ -150,13 +217,21 @@ def ingest_normalized_batch_rows(
         logger.exception("ingest_normalized_batch failed for %s reading(s): %s", len(unique), exc)
         raise
 
+    raised = []
     if alerts_enabled:
         for row in rows:
-            evaluate(row, db)
-    for row in rows:
-        broadcast_update(row)
+            alert = evaluate(row, db)
+            if alert is not None:
+                raised.append(alert)
 
     db.commit()
+
+    # Fan out only after the commit: a client must never be shown a row -- or an alert --
+    # that a failed commit then discards.
+    for row in rows:
+        broadcast_update(row)
+    for alert in raised:
+        broadcast_alert(alert)
     return len(rows), rows
 
 
@@ -182,13 +257,20 @@ def _ingest_rows_individually(
             continue
         stored.append(row)
 
+    raised = []
     if alerts_enabled:
         for row in stored:
-            evaluate(row, db)
-    for row in stored:
-        broadcast_update(row)
+            alert = evaluate(row, db)
+            if alert is not None:
+                raised.append(alert)
 
     db.commit()
+
+    # Post-commit, as above.
+    for row in stored:
+        broadcast_update(row)
+    for alert in raised:
+        broadcast_alert(alert)
     return len(stored), stored
 
 

@@ -5,8 +5,14 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from app.core.billing_units import PER_HOUR_OPERATION_TYPES, is_per_hour_operation
 
-PER_HOUR_OPERATION_TYPES = frozenset({"threshing", "grading"})
+__all__ = [
+    "PER_HOUR_OPERATION_TYPES",
+    "OperationChargeCreate",
+    "OperationChargeUpdate",
+    "OperationChargeRead",
+]
 
 
 class OperationChargeCreate(BaseModel):
@@ -17,8 +23,7 @@ class OperationChargeCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_rates(self) -> OperationChargeCreate:
-        op = (self.operation_type or "").strip().lower()
-        if op in PER_HOUR_OPERATION_TYPES:
+        if is_per_hour_operation(self.operation_type):
             hr = self.charge_per_hour
             if hr is None or hr <= 0:
                 raise ValueError("Threshing and Grading require a positive charge per hour (Rs/hr).")

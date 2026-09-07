@@ -217,3 +217,61 @@ def test_slot_errors_name_the_offending_type_and_valid_alternatives():
     assert "Rotavator" in message
     assert "MB Plough" in message  # lists valid passive alternatives
     assert "Active + Passive" in message  # points at the supported route
+
+
+# --- Primary vs secondary tillage draft coefficients ---------------------------
+
+
+def test_library_carries_both_primary_and_secondary_tillage_coefficients():
+    """ASABE D497 Table 1 tabulates the two stages separately; so must the library.
+
+    The same cultivator pulls ~1.44x harder doing primary work. Carrying only the
+    secondary triple under-predicted every primary pass.
+
+    Coefficients now live in `seed_data/seed_implements.json` (a JSON dataset
+    read verbatim by `seed_library.py`, not hardcoded Python literals), so this
+    checks the data file directly rather than the module's source text.
+    """
+    from app.utils.seed_library import _load_json
+
+    records = _load_json("seed_implements.json")
+    a_b_pairs = {(r["A"], r["B"]) for r in records}
+    # Secondary (cultivator, disc harrow) and primary (both implements' higher
+    # rows) coefficient sets must both be present.
+    assert (32, 1.9) in a_b_pairs
+    assert (46, 2.8) in a_b_pairs
+    assert (254, 13.2) in a_b_pairs
+    assert (364, 18.8) in a_b_pairs
+
+
+def test_the_sync_migration_no_longer_collapses_deliberate_coefficients():
+    """Regression guard on `l7m8n9o0p1q2`.
+
+    It used to UPDATE every library row of a type unconditionally, so a
+    primary-tillage row was silently reset to the secondary triple on the next
+    migration run -- the data gap was defended by the migration meant to fix it.
+    The `asae_param_a IS NULL` guard makes it the backfill it was meant to be.
+    """
+    # `alembic/versions` is not a package, so read the file rather than import it.
+    import pathlib
+
+    path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "l7m8n9o0p1q2_sync_library_draft_parameters.py"
+    )
+    src = path.read_text(encoding="utf-8")
+    assert "asae_param_a IS NULL" in src, (
+        "the sync migration must only backfill rows without coefficients"
+    )
+
+
+def test_primary_tillage_draft_is_meaningfully_higher_than_secondary():
+    """Pins the size of the gap the missing rows were hiding."""
+    from app.core.dss_shared import draft_force_n
+
+    common = dict(fi=0.7, asae_param_c=0.0, speed_kmh=4.0, depth_cm=15.0, width_m=9.0)
+    secondary = draft_force_n(asae_param_a=32.0, asae_param_b=1.9, **common)
+    primary = draft_force_n(asae_param_a=46.0, asae_param_b=2.8, **common)
+    assert primary / secondary == pytest.approx(1.444, abs=0.005)

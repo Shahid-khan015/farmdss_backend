@@ -15,7 +15,13 @@ from app.api.deps import get_db
 from app.middleware.auth import get_current_user, require_role
 from app.models.implement import Implement
 from app.models.iot_reading import IoTReading
-from app.models.session import FieldObservation, IoTAlert, OperationSession, SessionPresetValue
+from app.models.session import (
+    FieldObservation,
+    IoTAlert,
+    OperationSession,
+    SessionPause,
+    SessionPresetValue,
+)
 from app.models.tractor import Tractor
 from app.models.user import User
 from app.schemas.session import (
@@ -29,12 +35,28 @@ from app.schemas.session import (
     SessionStartRequest,
     SessionStopRequest,
 )
+from app.services.operation_cost_service import RateNotConfigured, lock_session_rate
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["Sessions"])
 alerts_router = APIRouter(prefix="/api/v1/alerts", tags=["Sessions"])
 GPS_FEED_KEYS = ("position_tracking", "gpsloc")
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_session_gate() -> None:
+    """Tell the ingestion transports the session landscape changed.
+
+    Imported lazily so importing this router does not pull in the transport stack, and
+    guarded because a gate refresh is an optimisation: failing to wake a transport must
+    never fail the lifecycle request the operator just made.
+    """
+    try:
+        from app.services.session_gate import GATE
+
+        GATE.refresh()
+    except Exception:
+        logger.exception("session gate refresh failed after a lifecycle change")
 
 
 def _warm_iot_for_session(session_id: str) -> None:
@@ -88,11 +110,50 @@ def _to_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _duration_minutes(started_at: datetime, ended_at: Optional[datetime]) -> float:
-    start = _to_utc(started_at)
-    end = _to_utc(ended_at) if ended_at else datetime.now(timezone.utc)
-    delta = end - start
-    return max(0.0, delta.total_seconds() / 60.0)
+def _worked_duration_minutes(session: OperationSession, db: Session) -> float:
+    """Minutes actually worked: wall clock minus every paused interval.
+
+    The same quantity Threshing/Grading are billed on, so the duration a farmer reads on
+    the summary is the duration they were charged for. An in-progress session is measured
+    to now.
+    """
+    from app.services.operation_cost_service import paused_seconds
+
+    start = _to_utc(session.started_at)
+    end = _to_utc(session.ended_at) if session.ended_at else datetime.now(timezone.utc)
+    elapsed = (end - start).total_seconds()
+    paused = float(paused_seconds(session.id, db, until=session.ended_at))
+    return max(0.0, (elapsed - paused) / 60.0)
+
+
+def _backfill_legacy_billing(session: OperationSession, db: Session) -> None:
+    """Close out a terminated session that predates the finalize-once billing path.
+
+    Deliberately narrow: it runs only when ``cost_finalized_at`` is NULL, i.e. the charge
+    was never issued. A session whose charge *is* final is never recomputed -- that used
+    to happen on every summary read and silently re-billed finished sessions at whatever
+    the owner's current rate happened to be.
+    """
+    if session.cost_finalized_at is not None:
+        return
+    if session.status not in ("completed", "aborted"):
+        return
+
+    from app.services.field_area_service import finalize_session_area
+    from app.services.operation_cost_service import (
+        finalize_cancelled_session,
+        finalize_session_billing,
+    )
+
+    if session.status == "aborted":
+        finalize_cancelled_session(session, db)
+    else:
+        if session.area_ha is None:
+            finalize_session_area(session.id, db)
+            db.refresh(session)
+        finalize_session_billing(session, db)
+    db.commit()
+    db.refresh(session)
 
 
 def _extract_lat_lon(raw_value: str) -> tuple[Optional[float], Optional[float]]:
@@ -176,23 +237,39 @@ def start_session(
         implement = db.get(Implement, implement_uuid)
         if implement is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Implement not found")
-        raw_width = getattr(implement, "working_width_m", None)
-        if raw_width is None:
-            raw_width = getattr(implement, "width", None)
+        # `Implement.resolved_width_m` is the one width-resolution rule every
+        # subsystem shares (working_width_m first, width as fallback) -- see
+        # its docstring for why this used to be duplicated here independently
+        # of the simulation engine's own (different) rule.
+        raw_width = implement.resolved_width_m
         if raw_width is not None:
             implement_width_m = float(raw_width)
 
+    owner_id = getattr(tractor, "owner_id", None)
     session = OperationSession(
         tractor_id=tractor.id,
         implement_id=implement_uuid,
         operator_id=current_user.id,
-        tractor_owner_id=getattr(tractor, "owner_id", None),
+        tractor_owner_id=owner_id,
         client_farmer_id=farmer_uuid,
         operation_type=body.operation_type,
         gps_tracking_enabled=body.gps_tracking_enabled,
         implement_width_m=implement_width_m,
         status="active",
     )
+
+    # Lock the owner's rate onto the session before it exists. Two things follow: the
+    # charge can never be re-derived from a rate card the owner edits later, and a session
+    # that could not be priced is refused up front rather than discovered to be unbillable
+    # once the work is already done.
+    try:
+        lock_session_rate(session, owner_id=owner_id, db=db)
+    except RateNotConfigured as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.reason,
+        ) from exc
+
     db.add(session)
     db.flush()
 
@@ -238,6 +315,10 @@ def start_session(
     db.commit()
     db.refresh(session)
 
+    # Wake the transports synchronously: the operator is about to watch this session, so
+    # the MQTT subscriber should be connecting before the response is even rendered.
+    _refresh_session_gate()
+
     # Pull telemetry immediately so the Active Session screen has live values on its first render
     # rather than waiting out a poll interval. Runs after the response; failures are logged only.
     background_tasks.add_task(_warm_iot_for_session, str(session.id))
@@ -259,16 +340,43 @@ def stop_session(
     if session.status not in ("active", "paused"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session is not active or paused")
 
-    session.ended_at = datetime.now(timezone.utc)
-    session.status = "completed"
     from app.services.field_area_service import finalize_session_area
-    from app.services.operation_cost_service import compute_session_cost
+    from app.services.ingest_buffer import BUFFER
+    from app.services.operation_cost_service import close_open_pause, finalize_session_billing
+    from app.services.session_gate import GATE
+
+    # 1. Flush the ingestion buffer FIRST, while the session is still `active`/`paused`
+    #    so buffered readings still resolve to it. Ordering is load-bearing: once the
+    #    status flips to "completed" it leaves ATTACHABLE_SESSION_STATUSES, those
+    #    readings attach to nothing, and they vanish from the GPS path -- and therefore
+    #    from the worked area, and therefore from the bill.
+    BUFFER.flush()
+
+    # 2. Only now close the session. The explicit flush replaces an accidental one:
+    #    `SessionLocal` is autoflush=False, and the `db.refresh` below used to depend on
+    #    `finalize_session_area` happening to call `db.flush()` inside another module.
+    #    Stopping straight from `paused` closes the open pause interval at the same
+    #    instant, so the trailing pause is neither billed nor left dangling.
+    ended_at = datetime.now(timezone.utc)
+    close_open_pause(session, db, at=ended_at)
+    session.ended_at = ended_at
+    session.status = "completed"
+    db.flush()
+
+    # 3. Area and cost, computed over a complete set of readings. This is the one and only
+    #    place a completed session's charge is written; read paths report it, never
+    #    recompute it.
     finalize_session_area(session_id, db)
     db.refresh(session)
-    compute_session_cost(session, db)
+    finalize_session_billing(session, db)
     db.commit()
     db.refresh(session)
-    return _to_session_response(session)
+    response = _to_session_response(session)
+
+    # 4. Last statement, after the commit: let the transports go dormant and the
+    #    connection pool dispose if nothing else is running.
+    GATE.refresh()
+    return response
 
 
 @router.patch("/{session_id}/pause", response_model=SessionResponse)
@@ -285,10 +393,18 @@ def pause_session(
     if session.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only active sessions can be paused")
 
+    # Open a pause interval. Billing reads this ledger twice: to net idle time out of the
+    # hours a Threshing/Grading session is charged for, and to drop GPS fixes recorded
+    # while paused so transit between fields is not billed as hectares covered.
     session.status = "paused"
+    db.add(SessionPause(session_id=session.id, paused_at=datetime.now(timezone.utc)))
     db.commit()
     db.refresh(session)
-    return _to_session_response(session)
+    response = _to_session_response(session)
+    # The gate stays OPEN while paused -- telemetry must keep attaching so the GPS trail
+    # stays continuous for finalize_session_area. Refreshing anyway keeps it honest.
+    _refresh_session_gate()
+    return response
 
 
 @router.patch("/{session_id}/resume", response_model=SessionResponse)
@@ -305,10 +421,63 @@ def resume_session(
     if session.status != "paused":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only paused sessions can be resumed")
 
+    from app.services.operation_cost_service import close_open_pause
+
+    close_open_pause(session, db, at=datetime.now(timezone.utc))
     session.status = "active"
     db.commit()
     db.refresh(session)
-    return _to_session_response(session)
+    response = _to_session_response(session)
+    _refresh_session_gate()
+    return response
+
+
+@router.post("/{session_id}/cancel", response_model=SessionResponse)
+def cancel_session(
+    session_id: uuid.UUID,
+    current_user: User = Depends(require_role(["operator"])),
+    db: Session = Depends(get_db),
+):
+    """Abandon a session without billing it.
+
+    A session started by mistake previously had no exit but `stop`, which issues a charge.
+    Cancelling terminates it at a final zero: the status becomes `aborted`, the charge is
+    finalized at Rs 0.00 so nothing can later re-price it, and it drops out of the owner's
+    charge totals. Area is still finalized so the map and the telemetry record stay
+    intact.
+    """
+    session = db.get(OperationSession, session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    if session.operator_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not own this session")
+    if session.status not in ("active", "paused"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session is not active or paused")
+
+    from app.services.field_area_service import finalize_session_area
+    from app.services.ingest_buffer import BUFFER
+    from app.services.operation_cost_service import close_open_pause, finalize_cancelled_session
+    from app.services.session_gate import GATE
+
+    # Same ordering rationale as `stop_session`: flush buffered readings while the session
+    # is still attachable, so the recorded trail is complete even though it is not billed.
+    BUFFER.flush()
+
+    ended_at = datetime.now(timezone.utc)
+    close_open_pause(session, db, at=ended_at)
+    session.ended_at = ended_at
+    session.status = "aborted"
+    db.flush()
+
+    finalize_session_area(session_id, db)
+    db.refresh(session)
+    finalize_cancelled_session(session, db)
+    db.commit()
+    db.refresh(session)
+    response = _to_session_response(session)
+
+    GATE.refresh()
+    return response
 
 
 @router.get("/active", response_model=list[SessionResponse])
@@ -363,7 +532,7 @@ def get_session_detail(
         preset_values=[PresetValueResponse.model_validate(p) for p in session.preset_values],
         alerts=[AlertResponse.model_validate(a) for a in session.alerts],
         field_observations=[FieldObservationResponse.model_validate(o) for o in session.field_observations],
-        total_duration_minutes=_duration_minutes(session.started_at, session.ended_at),
+        total_duration_minutes=_worked_duration_minutes(session, db),
     )
 
 
@@ -577,24 +746,14 @@ def get_session_area_summary(
         )
     ) or 0
 
-    if session.status == "completed" and (
-        session.area_ha is None
-        or session.total_cost_inr is None
-        or session.charge_per_ha_applied is None
-    ):
-        from app.services.field_area_service import finalize_session_area
-        from app.services.operation_cost_service import compute_session_cost
-
-        if session.area_ha is None:
-            finalize_session_area(session_id, db)
-        db.refresh(session)
-        compute_session_cost(session, db)
-        db.commit()
-        db.refresh(session)
+    # Only ever closes out a session whose charge was never issued (legacy rows). A
+    # finalized session is reported as-is: this endpoint used to recompute the cost on
+    # every poll, which is one of the paths that let a rate edit rewrite a finished bill.
+    _backfill_legacy_billing(session, db)
 
     duration_minutes: Optional[float] = None
     if session.started_at is not None:
-        duration_minutes = _duration_minutes(session.started_at, session.ended_at)
+        duration_minutes = _worked_duration_minutes(session, db)
 
     return {
         "session_id": str(session_id),
@@ -602,6 +761,8 @@ def get_session_area_summary(
         "implement_width_m": float(session.implement_width_m) if session.implement_width_m is not None else None,
         "total_gps_points": int(total_gps_points),
         "session_duration_minutes": duration_minutes,
+        "billable_hours": float(session.billable_hours) if session.billable_hours is not None else None,
+        "charge_unit": session.charge_unit,
         "operation_type": session.operation_type,
         "status": session.status,
     }

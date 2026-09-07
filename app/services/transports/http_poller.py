@@ -15,7 +15,9 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import SessionLocal
 from app.models.session import OperationSession
+from app.services.ingest_buffer import BUFFER
 from app.services.ingestion_pipeline import ATTACHABLE_SESSION_STATUSES, ingest_normalized_batch
+from app.services.session_gate import GATE
 from app.services.normalizer import FEEDS, NormalizedReading, adafruit_slug_for_feed_key, process_iot_data
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,9 @@ class IngestionStatus:
     last_cycle_stored: int = 0
     last_cycle_feeds_ok: int = 0
     last_cycle_feeds_failed: List[str] = field(default_factory=list)
+    #: Feeds that exist but hold no data points yet. Reported separately from failures
+    #: so a never-written feed is not a permanent false alarm.
+    last_cycle_feeds_empty: List[str] = field(default_factory=list)
     cycles_total: int = 0
     consecutive_failures: int = 0
     current_interval_sec: Optional[float] = None
@@ -56,6 +61,7 @@ class IngestionStatus:
             "last_cycle_stored": self.last_cycle_stored,
             "last_cycle_feeds_ok": self.last_cycle_feeds_ok,
             "last_cycle_feeds_failed": list(self.last_cycle_feeds_failed),
+            "last_cycle_feeds_empty": list(self.last_cycle_feeds_empty),
             "cycles_total": self.cycles_total,
             "consecutive_failures": self.consecutive_failures,
             "current_interval_sec": self.current_interval_sec,
@@ -109,9 +115,15 @@ def _fetch_feed_rows(
     feed_key: str,
     limit: int,
     deadline: Optional[float] = None,
-) -> List[Any]:
+) -> Optional[List[Any]]:
     """
     Fetch recent data points for one feed.
+
+    Returns the rows, or ``None`` when the fetch genuinely failed. That distinction
+    matters: an empty list is a legitimate answer for a feed that exists but has never
+    been written to, and conflating the two makes such a feed show up as "failed" on
+    every cycle forever -- a permanent false alarm that teaches people to ignore the
+    diagnostic. (`machine-status` on the reference account is exactly this case.)
 
     Retries are bounded by ``deadline`` (a ``time.monotonic()`` instant) so a single unhealthy
     feed degrades its own freshness instead of stalling the whole cycle behind it.
@@ -151,7 +163,7 @@ def _fetch_feed_rows(
 
     if last_exc:
         logger.error("Adafruit HTTP fetch gave up feed=%s: %s", feed_key, last_exc)
-    return []
+    return None
 
 
 def fetch_all_feeds(
@@ -174,7 +186,7 @@ def fetch_all_feeds(
     deadline = time.monotonic() + budget
     client = get_client()
 
-    def _one(feed_key: str) -> Tuple[str, List[Any]]:
+    def _one(feed_key: str) -> Tuple[str, Optional[List[Any]]]:
         try:
             return feed_key, _fetch_feed_rows(
                 client,
@@ -187,18 +199,23 @@ def fetch_all_feeds(
         except Exception:
             # An unexpected error on one feed must not abort the whole cycle.
             logger.exception("Adafruit fetch raised unexpectedly feed=%s", feed_key)
-            return feed_key, []
+            return feed_key, None
 
-    results: List[Tuple[str, List[Any]]] = []
+    results: List[Tuple[str, Optional[List[Any]]]] = []
     with ThreadPoolExecutor(max_workers=min(len(FEEDS), 10), thread_name_prefix="aio-fetch") as pool:
         for outcome in pool.map(_one, list(FEEDS)):
             results.append(outcome)
 
     batch: List[NormalizedReading] = []
     failed: List[str] = []
+    empty: List[str] = []
     for feed_key, rows in results:
-        if not rows:
+        if rows is None:
             failed.append(feed_key)
+            continue
+        if not rows:
+            # The feed exists but has no data points yet. Not an error.
+            empty.append(feed_key)
             continue
         for row in rows:
             if not isinstance(row, dict):
@@ -208,6 +225,12 @@ def fetch_all_feeds(
             )
             if normalized is not None:
                 batch.append(normalized)
+
+    STATUS.last_cycle_feeds_empty = empty
+    if empty:
+        logger.info(
+            "Adafruit feeds with no data points yet (not an error): %s", ", ".join(sorted(empty))
+        )
     return batch, failed
 
 
@@ -259,17 +282,27 @@ def run_http_poller_loop(stop: threading.Event, interval_sec: float) -> None:
     """
     Blocking loop for a daemon thread; stops when `stop` is set.
 
-    Cadence follows session state: hot while an operation is running, slow otherwise. A
-    permanently hot poll keeps a managed Postgres compute from ever suspending and burns CPU
-    collecting data nobody is reading. Set IOT_IDLE_POLL_INTERVAL_SEC == the active interval to
-    disable the gating.
+    **Backfill, not the hot path.** With the MQTT subscriber pushing readings as they
+    arrive, this loop exists to catch what MQTT missed (a dropped connection, a message
+    lost while the process was restarting). It therefore runs at the much slower
+    `IOT_BACKFILL_POLL_INTERVAL_SEC` so the two transports stop competing for the same
+    data points -- they converge on one row either way now that MQTT carries Adafruit's
+    real record id, but there is no reason to fetch twice.
+
+    **Fully dormant when no session is running.** The loop parks on the session gate
+    rather than polling at a slow idle cadence: no Adafruit request, no database query,
+    no connection held. That is what lets the database compute suspend between sessions.
+
+    It also owns the buffer's flush timer -- it is already a ticking loop, so the
+    micro-batch needs no thread of its own.
     """
     active_interval = max(3.0, float(interval_sec))
     idle_interval = max(active_interval, float(settings.IOT_IDLE_POLL_INTERVAL_SEC))
+    recheck = float(getattr(settings, "IOT_GATE_RECHECK_SEC", 30.0))
 
     STATUS.started_at = _now_iso()
     logger.info(
-        "IoT poller loop starting (active=%ss idle=%ss feeds=%s limit=%s)",
+        "IoT poller loop starting (backfill=%ss idle=%ss feeds=%s limit=%s)",
         active_interval,
         idle_interval,
         len(FEEDS),
@@ -279,8 +312,22 @@ def run_http_poller_loop(stop: threading.Event, interval_sec: float) -> None:
     while not stop.is_set():
         cycle_start = time.monotonic()
         interval = active_interval
+
+        # Flush regardless of gate state: readings can still be buffered from a session
+        # that has just ended.
         try:
-            session_active = has_attachable_session()
+            BUFFER.flush_if_due()
+        except Exception:
+            logger.exception("buffer flush from poller loop failed")
+
+        if not GATE.is_open():
+            STATUS.session_active = False
+            STATUS.current_interval_sec = None
+            GATE.wait_for_change(timeout=recheck)
+            continue
+
+        try:
+            session_active = True
             interval = choose_interval(session_active, active_interval, idle_interval)
             STATUS.session_active = session_active
             STATUS.current_interval_sec = interval
@@ -323,4 +370,8 @@ def run_http_poller_loop(stop: threading.Event, interval_sec: float) -> None:
             break
 
     close_client()
+    try:
+        BUFFER.flush()
+    except Exception:
+        logger.exception("final buffer flush on poller shutdown failed")
     logger.info("IoT poller loop stopped after %s cycle(s)", STATUS.cycles_total)

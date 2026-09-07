@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 from app.core.constants import (
     DIESEL_CALORIFIC_VALUE,
@@ -50,6 +51,7 @@ __all__ = [
     "require_positive",
     "safe_div",
     "safe_sqrt",
+    "round_half_away_from_zero",
     "draft_force_n",
     "GeometryTerms",
     "geometry_terms",
@@ -101,6 +103,21 @@ def safe_sqrt(name: str, value: float) -> float:
     if value < 0:
         raise ValueError("Cannot compute {0}: square root of a negative value ({1!r})".format(name, value))
     return math.sqrt(value)
+
+
+def round_half_away_from_zero(value: float) -> int:
+    """Round to the nearest integer, ties rounding away from zero.
+
+    Python's built-in `round()` is banker's rounding (ties to even):
+    `round(2.5) == 2`, `round(0.5) == 0`. Excel's `ROUND()` and JavaScript's
+    `Math.round()` both round ties away from zero instead: `2.5 -> 3`,
+    `0.5 -> 1`. The two disagree at every exact `x.5` boundary with an even
+    integer part, which is silent and easy to miss -- `number_turns` below is
+    the one place in this engine where the choice is externally visible.
+    """
+    if value >= 0:
+        return math.floor(value + 0.5)
+    return -math.floor(-value + 0.5)
 
 
 # --- Draft (DSS Eq. 3.1) ----------------------------------------------------
@@ -219,14 +236,19 @@ def field_capacity(
     `C73`). They were previously tagged [LEGACY]/"absent from the DSS document",
     which was wrong -- the document omits them, but the reference stack does not.
 
-    **Unresolved discrepancy (turning-time factor of 2).** Total headland time is
-    computed as `turning_time_s * 2 * number_turns`. The spreadsheet has no such
-    factor (`C71 = (C68*C67)/3600`); `tillage_dss.html` has it, but that file is a
-    port of this engine and so is not independent corroboration. No source derives
-    the 2 either way. Current behaviour is preserved deliberately -- silently
-    dropping it would shift every actual-capacity and fuel-per-hectare figure -- and
-    `turning_time_single_pass_basis_h` reports the unfactored value alongside it so
-    the disagreement is visible. Needs a ruling from the DSS author.
+    **Turning-time factor of 2, corroborated but not conclusively ruled on.** Total
+    headland time is computed as `turning_time_s * 2 * number_turns`. The spreadsheet
+    has no such factor (`C71 = (C68*C67)/3600`); `tillage_dss.html` has it, but that
+    file is a port of this engine and so is not independent corroboration on its own.
+    `farmdss/Rakesh Dss/Front _screen.frm` (Command6_Click, line 3169), the 2006 VB6
+    tool this whole DSS derives from, independently carries the identical factor of
+    2 -- genuinely independent and older than the spreadsheet itself, so this is now
+    2-of-3 sources in agreement rather than "no source either way". Current behaviour
+    is preserved -- silently dropping it would shift every actual-capacity and
+    fuel-per-hectare figure -- and `turning_time_single_pass_basis_h` reports the
+    unfactored value alongside it so the disagreement is visible. Still worth a
+    definitive ruling from the DSS author; neither corroborating source states why
+    the factor exists, only that both apply it.
 
     `field_eff_raw_pct` exposes the unclamped ratio, because the clamp can make
     the reported efficiency inconsistent with the reported capacities.
@@ -245,7 +267,11 @@ def field_capacity(
         - TURNING_TIME_COEFF_SPEED * speed_kmh,
         *TURNING_TIME_CLAMP,
     )
-    number_turns = max(0, int(round(field_width_m / width_m)))
+    # Not the builtin `round()` -- see round_half_away_from_zero's docstring.
+    # Excel's `C68 = ROUND(C12/C14, 0)` and both HTML's `Math.round` round ties
+    # away from zero; Python's builtin rounds ties to even, disagreeing at exact
+    # half-integer ratios (e.g. field_width/width == 2.5 -> 2 vs the reference's 3).
+    number_turns = max(0, round_half_away_from_zero(field_width_m / width_m))
     single_pass_turning_time_h = (turning_time_s * number_turns) / 3600.0
     total_turning_time_h = single_pass_turning_time_h * 2.0
     theoretical_time_h = field_area_ha / fc_th
@@ -292,8 +318,12 @@ class PowerFuel:
     put_pct: float
     x_fraction: float
     sfc: float
+    #: Primary basis: SFC x (Ptr + PPTO). See `power_and_fuel` for why not drawbar.
     fuel_lph: float
+    fuel_basis: str
     fuel_lph_pto_basis: float
+    #: Diagnostic only -- SFC x DBp, the basis the spreadsheet uses.
+    fuel_lph_drawbar_basis: float
     fuel_l_per_ha: float
     overall_pct: float
 
@@ -324,17 +354,27 @@ def power_and_fuel(
     exactly how the document derives Section 4 from Section 5 ("Section 4's
     equations are the special case of Section 5's obtained by setting PPTO = 0").
 
-    Fuel basis [REFERENCE-CONFIRMED]: the DSS document gives SFC in L/kW-h and
-    stops there, which previously made this a documented ambiguity. It is settled
-    by the spreadsheet's own cell formula: `C65 = C64*C60`, i.e. literally
-    `SFC * DBp`. (Its *note* column reads "SFC * Rated PTO power * 0.88", which
-    contradicts the formula beside it -- the formula is authoritative; that note
-    is one of three stale ones in the workbook.) `fuel_lph = SFC * DBp` is
-    therefore the reference behaviour, not merely preserved legacy.
+    **Fuel basis: drawbar power, not PTO power.**
 
-    `fuel_lph_pto_basis = SFC * (Ptr + PPTO)` -- the reading that is
-    dimensionally consistent with X -- is computed alongside it as a diagnostic
-    and deliberately feeds nothing.
+        fuel_lph = SFC * DBp
+
+    **Reverted** to match `docs/tillage_dss (2).html`'s engine exactly
+    (`powerAndFuel`: `fuelLph = sfc * pdbKw`). This matches the spreadsheet's cell
+    formula, `C65 = C64*C60`, and the 2006 VB6 original this DSS derives from
+    (`Front _screen.frm`, line 3242: `Fuel_cons = SFC * Pdb / FC_ac`) -- two
+    independent historical sources on the drawbar basis.
+
+    This undoes a physics-based correction from a prior session, which is recorded
+    here rather than erased: the engine burns fuel to produce
+    `Ptr = DBp / (TE * eta_t)`, and does so regardless of how much of that survives
+    wheel slip as useful drawbar pull, so billing fuel against `DBp` still silently
+    discards the slip-loss fraction of real consumption -- a factor of
+    `1 / (TE * eta_t)`, 2-4x at ordinary working slips. That argument was
+    corroborated by field data (a 9-tyne cultivator at 3 km/h/20 cm/fine soil landed
+    near the 15-18 L/ha commonly reported on the PTO basis, far below it on the
+    drawbar basis) and still stands physically -- it is simply not what production
+    computes any more, for HTML parity. `fuel_lph_pto_basis` is retained as the
+    diagnostic so this reasoning stays checkable against a live run.
     """
     require_positive("rated PTO power", pto_power_kw)
     require_positive("operating speed", speed_kmh)
@@ -357,8 +397,9 @@ def power_and_fuel(
     x_fraction = safe_div("PTO power fraction", total_pto_kw, pto_power_kw)
 
     sfc = specific_fuel_consumption_l_per_kwh(x_fraction)
-    fuel_lph = sfc * pdb_kw
     fuel_lph_pto_basis = sfc * total_pto_kw
+    fuel_lph_drawbar_basis = sfc * pdb_kw
+    fuel_lph = fuel_lph_drawbar_basis
     # Floored at 0, never capped: both reference implementations report the raw
     # ratio, and an upper cap would disguise a genuinely over-worked pairing.
     fuel_l_per_ha = max(0.0, safe_div("fuel consumption per hectare", fuel_lph, fc_ac))
@@ -380,7 +421,9 @@ def power_and_fuel(
         x_fraction=x_fraction,
         sfc=sfc,
         fuel_lph=fuel_lph,
+        fuel_basis="drawbar",
         fuel_lph_pto_basis=fuel_lph_pto_basis,
+        fuel_lph_drawbar_basis=fuel_lph_drawbar_basis,
         fuel_l_per_ha=fuel_l_per_ha,
         overall_pct=overall_pct,
     )
@@ -405,6 +448,8 @@ def put_load_status(power_utilization_pct: float) -> str:
 @dataclass(frozen=True)
 class ResultEnvelope:
     load_status: str
+    #: Empty string when Table 4.2 raises nothing -- the document gives no
+    #: "everything is fine" message, so none is invented.
     recommendations: str
     recommendation_messages: list
     status: str
@@ -414,26 +459,31 @@ class ResultEnvelope:
 
 def result_envelope(
     *,
-    slip: float,
-    draft_n: float,
-    te_pct: float,
-    fuel_l_per_ha: float,
+    slip: Optional[float],
+    net_traction_coefficient: Optional[float],
+    front_weight_utilization: Optional[float],
+    fi: Optional[float],
     put_pct: float,
     field_eff_pct: float,
     converged: bool,
 ) -> ResultEnvelope:
     """Status / recommendation / confidence tail shared by all three modes.
 
-    [LEGACY] -- the thresholds live in `engineering_validation` and are advisory
-    UI text, not part of the DSS derivation.
+    Recommendations follow DSS **Table 4.2** -- see `build_recommendations`. That
+    needs `mu`, `Kwef` and `Fi`, none of which this function used to receive; two
+    of the document's four conditions were therefore unimplementable before.
+
+    Every parameter that Table 4.2 keys on is Optional because a standalone active
+    implement has no draft chain: it has no slip, no mu and no Kwef, and only the
+    Put rule applies. Passing None skips that condition rather than failing it.
     """
     load_status = put_load_status(put_pct)
     recommendation_items = build_recommendations(
         slip=slip,
-        draft_force=draft_n,
-        traction_efficiency=te_pct,
-        fuel_consumption=fuel_l_per_ha,
+        net_traction_coefficient=net_traction_coefficient,
+        front_weight_utilization=front_weight_utilization,
         power_utilization=put_pct,
+        fi=fi,
     )
     recommendation = "; ".join(recommendation_items)
     simulation_status = derive_simulation_status(
@@ -445,7 +495,9 @@ def result_envelope(
     return ResultEnvelope(
         load_status=load_status,
         recommendations=recommendation,
-        recommendation_messages=recommendation.split("; "),
+        # `"".split("; ")` yields `[""]`, not `[]` -- guard it, or every caller with
+        # no advice ships a single empty-string message.
+        recommendation_messages=recommendation_items,
         status=simulation_status,
         status_message=load_status if converged else simulation_status,
         confidence=derive_confidence(compatible=True, converged=converged, slip=slip),

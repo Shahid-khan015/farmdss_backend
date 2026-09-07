@@ -7,6 +7,7 @@ from app.models.iot_reading import IoTReading
 from app.models.operation_charge import OperationCharge
 from app.models.session import (
     OperationSession,
+    SessionPause,
     SessionPresetValue,
     IoTAlert,
     FieldObservation,
@@ -24,6 +25,7 @@ __all__ = [
     "IoTReading",
     "OperationCharge",
     "OperationSession",
+    "SessionPause",
     "SessionPresetValue",
     "IoTAlert",
     "FieldObservation",

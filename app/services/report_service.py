@@ -25,19 +25,23 @@ class ReportFilters:
 
 
 def _finalize_completed_sessions_for_report(session_ids: list[UUID], db: Session) -> None:
+    """Close out terminated sessions whose charge was never issued.
+
+    Keyed strictly on ``cost_finalized_at IS NULL``. A session with a final charge is left
+    exactly as it stands -- running a report must never re-price settled work.
+    """
     from app.services.field_area_service import finalize_session_area
-    from app.services.operation_cost_service import compute_session_cost
+    from app.services.operation_cost_service import (
+        finalize_cancelled_session,
+        finalize_session_billing,
+    )
 
     sessions = list(
         db.scalars(
             select(OperationSession).where(
                 OperationSession.id.in_(session_ids),
-                OperationSession.status == "completed",
-                or_(
-                    OperationSession.area_ha.is_(None),
-                    OperationSession.total_cost_inr.is_(None),
-                    OperationSession.charge_per_ha_applied.is_(None),
-                ),
+                OperationSession.status.in_(("completed", "aborted")),
+                OperationSession.cost_finalized_at.is_(None),
             )
         ).all()
     )
@@ -45,10 +49,13 @@ def _finalize_completed_sessions_for_report(session_ids: list[UUID], db: Session
         return
 
     for session in sessions:
+        if session.status == "aborted":
+            finalize_cancelled_session(session, db)
+            continue
         if session.area_ha is None:
             finalize_session_area(session.id, db)
             db.refresh(session)
-        compute_session_cost(session, db)
+        finalize_session_billing(session, db)
     db.commit()
 
 
@@ -96,10 +103,14 @@ def generate_report(filters: ReportFilters, db: Session) -> dict:
     _finalize_completed_sessions_for_report(session_ids, db)
     base = select(OperationSession.id).where(OperationSession.id.in_(session_ids)).subquery()
 
-    duration_hours_expr = (
+    # Prefer the persisted worked hours (wall clock net of pauses -- the same figure
+    # Threshing/Grading are billed on); fall back to wall clock for sessions that predate
+    # the pause ledger.
+    wall_clock_hours_expr = (
         func.extract("epoch", func.coalesce(OperationSession.ended_at, OperationSession.started_at) - OperationSession.started_at)
         / 3600.0
     )
+    duration_hours_expr = func.coalesce(OperationSession.billable_hours, wall_clock_hours_expr)
 
     summary_stmt = (
         select(
@@ -111,20 +122,21 @@ def generate_report(filters: ReportFilters, db: Session) -> dict:
     )
     total_sessions, total_area_ha, total_duration_hours = db.execute(summary_stmt).one()
 
-    charges_stmt = select(
-        func.coalesce(
-            func.sum(
-                func.coalesce(OperationSession.total_cost_inr, WageRecord.total_amount, 0.0)
-            ),
-            0.0,
+    # Two distinct sums, deliberately not coalesced into one another: operation charges are
+    # what the farmer is billed, wages are what the operator is paid. These used to be the
+    # same expression reported under both keys, so one number was shown twice as though it
+    # were two, and a session with both configured contributed only whichever came first.
+    total_operation_charges = db.scalar(
+        select(func.coalesce(func.sum(OperationSession.total_cost_inr), 0.0)).where(
+            OperationSession.id.in_(select(base.c.id))
         )
-    ).outerjoin(
-        WageRecord,
-        WageRecord.session_id == OperationSession.id,
-    ).where(
-        OperationSession.id.in_(select(base.c.id)),
-    )
-    total_operation_charges = db.scalar(charges_stmt) or 0.0
+    ) or 0.0
+
+    total_wages_paid = db.scalar(
+        select(func.coalesce(func.sum(WageRecord.total_amount), 0.0)).where(
+            WageRecord.session_id.in_(select(base.c.id))
+        )
+    ) or 0.0
 
     fuel_stmt = select(
         func.coalesce(func.sum(FuelLog.litres), 0.0),
@@ -182,7 +194,7 @@ def generate_report(filters: ReportFilters, db: Session) -> dict:
         "total_sessions": int(total_sessions or 0),
         "total_area_ha": float(total_area_ha or 0.0),
         "total_duration_hours": float(total_duration_hours or 0.0),
-        "total_wages_paid": float(total_operation_charges or 0.0),
+        "total_wages_paid": float(total_wages_paid or 0.0),
         "total_operation_charges": float(total_operation_charges or 0.0),
         "total_fuel_litres": float(total_fuel_litres or 0.0),
         "total_fuel_cost": float(total_fuel_cost or 0.0),

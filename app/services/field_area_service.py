@@ -4,7 +4,8 @@ import json
 import logging
 import math
 import uuid
-from typing import List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -12,12 +13,59 @@ from sqlalchemy import or_
 GPS_FEED_KEYS = ("position_tracking", "gpsloc")
 MAX_REASONABLE_GPS_STEP_M = 500.0
 
+#: A half-open paused interval; ``None`` as the end means "still paused".
+PauseWindow = Tuple[datetime, Optional[datetime]]
+
 logger = logging.getLogger(__name__)
 
 
-def parse_gps_points(session_id: uuid.UUID, db: Session) -> List[Tuple[float, float]]:
+def _to_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def load_pause_windows(session_id: uuid.UUID, db: Session) -> List[PauseWindow]:
+    """The paused intervals of a session, ordered, for excluding idle telemetry."""
+    from app.models.session import SessionPause
+
+    rows = (
+        db.query(SessionPause)
+        .filter(SessionPause.session_id == session_id)
+        .order_by(SessionPause.paused_at.asc())
+        .all()
+    )
+    return [
+        (_to_utc(row.paused_at), _to_utc(row.resumed_at) if row.resumed_at is not None else None)
+        for row in rows
+    ]
+
+
+def _is_paused_at(ts: Optional[datetime], windows: Sequence[PauseWindow]) -> bool:
+    if ts is None:
+        return False
+    moment = _to_utc(ts)
+    for start, end in windows:
+        if moment >= start and (end is None or moment <= end):
+            return True
+    return False
+
+
+def parse_gps_points(
+    session_id: uuid.UUID,
+    db: Session,
+    *,
+    exclude_windows: Optional[Sequence[PauseWindow]] = None,
+) -> List[Tuple[float, float]]:
+    """GPS fixes for a session, oldest first.
+
+    ``exclude_windows`` drops fixes recorded while the session was paused. Billing passes
+    the session's pause windows -- a machine driven to another field during a pause is not
+    doing chargeable work, and path length times implement width would otherwise bill that
+    transit as hectares covered. The map endpoints pass nothing, so the displayed trail
+    stays continuous; the readings are stored either way.
+    """
     from app.models.iot_reading import IoTReading
 
+    windows = tuple(exclude_windows or ())
     points: List[Tuple[float, float]] = []
     try:
         rows = (
@@ -36,6 +84,9 @@ def parse_gps_points(session_id: uuid.UUID, db: Session) -> List[Tuple[float, fl
         return []
 
     for reading in rows:
+        if windows and _is_paused_at(reading.device_timestamp, windows):
+            continue
+
         lat: Optional[float] = None
         lon: Optional[float] = None
 
@@ -152,10 +203,20 @@ def compute_total_path_distance_m(points: List[Tuple[float, float]]) -> float:
     return sum(_filtered_path_segments(points))
 
 
+def worked_gps_points(session_id: uuid.UUID, db: Session) -> List[Tuple[float, float]]:
+    """The GPS fixes that count as work -- i.e. excluding paused intervals.
+
+    This is the path billing is derived from, so the summary's reported distance is
+    computed from it too: ``distance_m x implement_width_m / 10000`` must reconcile with
+    the ``area_ha`` the charge was calculated on.
+    """
+    return parse_gps_points(session_id, db, exclude_windows=load_pause_windows(session_id, db))
+
+
 def finalize_session_area(session_id: uuid.UUID, db: Session) -> float:
     from app.models.session import OperationSession
 
-    points = parse_gps_points(session_id, db)
+    points = worked_gps_points(session_id, db)
     session = db.query(OperationSession).filter(OperationSession.id == session_id).first()
     if session is None:
         return 0.0

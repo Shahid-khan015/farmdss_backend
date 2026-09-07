@@ -246,18 +246,26 @@ def test_the_specified_te_form_costs_headroom_on_a_matched_pairing():
 # --- Eq. 3.1's `W` for tined implements ---------------------------------------
 
 
-def test_cultivator_draft_uses_tool_count_not_width_in_metres():
-    """ASABE D497 tabulates field cultivators per tool; `A = 32` is a per-tool row.
+def test_cultivator_draft_scales_with_whatever_number_w_is_given():
+    """ASABE D497 tabulates field cultivators per tool; `A = 32` is a per-tool row,
+    so a tool-count `W` (e.g. 9 for a 9-tine cultivator) is the D497-faithful
+    reading. `draft_force_n` itself takes whichever number it's given for `width_m`
+    and applies Eq. 3.1 uniformly -- this pins the raw arithmetic for both readings,
+    it does not say which one `draft_width_parameter` picks.
 
-    Both the workbook and the HTML use metres for every implement class. That
-    reading makes draft scale with width in a way that cancels -- ~505 N/m at every
-    cultivator size, so the number carries no information -- and drops a 9-tine
-    cultivator's draft below a rotavator's forward thrust, which makes effective
-    draft non-positive and fails every active-passive run.
+    Production (`legacy_algorithms.draft_width_parameter`,
+    `constants.DRAFT_WIDTH_IS_TOOL_COUNT`) currently reads **metres**, matching both
+    the workbook and `docs/tillage_dss (2).html` -- which makes draft scale with
+    width in a way that cancels (~505 N/m at every cultivator size, so the number
+    carries no size information) and can drop a 9-tine cultivator's draft below a
+    rotavator's forward thrust in active-passive combinations. A tool-count reading
+    was adopted for one session instead, and is a one-line revert away
+    (`DRAFT_WIDTH_IS_TOOL_COUNT = frozenset({"Cultivator"})`) if D497 fidelity is
+    ever prioritised over HTML parity again.
 
-    The workbook corroborates the tool-count reading against itself: its own
-    cultivator widths (2.20 / 2.66 / 3.13 m for 9 / 11 / 13 tines) imply a tine
-    spacing of 244 / 242 / 241 mm -- textbook and consistent.
+    The workbook corroborates the tool-count reading against itself, for the record:
+    its own cultivator widths (2.20 / 2.66 / 3.13 m for 9 / 11 / 13 tines) imply a
+    tine spacing of 244 / 242 / 241 mm -- textbook and consistent.
     """
     common = dict(
         fi=1.0, asae_param_a=32.0, asae_param_b=1.9, asae_param_c=0.0,
@@ -324,13 +332,24 @@ def test_slip_exponent_is_the_value_the_workbook_uses_not_the_documents():
     assert TRACTION_SLIP_EXPONENT_COEFF == 7.5
 
 
-def test_fuel_per_hour_uses_the_drawbar_basis_the_workbook_computes(result):
-    """`C65 = C64*C60` = SFC x DBp.
+def test_fuel_per_hour_matches_the_workbooks_own_drawbar_basis(result):
+    """`C65 = C64*C60` is SFC x DBp -- matched exactly, and also matches
+    `docs/tillage_dss (2).html`'s `fuelLph = sfc * pdbKw`.
 
-    The workbook's note column beside it reads "SFC * Rated PTO power * 0.88",
-    contradicting its own formula; the formula is authoritative. The PTO-power
-    basis is reported separately as a diagnostic and feeds nothing.
+    A PTO-power basis (billing against `Ptr`, the power actually produced) was
+    adopted for one session on physical grounds and is still emitted as the
+    `fuel_l_per_hour_pto_basis` diagnostic; the two differ by exactly the traction
+    loss `1/(TE x eta_t)`.
     """
-    expected = result["specific_fuel_consumption"] * result["drawbar_power"]
-    assert result["fuel_l_per_hour"] == pytest.approx(expected, rel=1e-9)
-    assert result["fuel_l_per_hour_pto_basis"] != pytest.approx(expected, rel=1e-6)
+    sfc = result["specific_fuel_consumption"]
+    assert result["fuel_basis"] == "drawbar"
+    assert result["fuel_l_per_hour"] == pytest.approx(
+        sfc * result["drawbar_power"], rel=1e-9
+    )
+    assert result["fuel_l_per_hour_pto_basis"] == pytest.approx(
+        sfc * result["required_pto_power"], rel=1e-9
+    )
+    ratio = result["fuel_l_per_hour_pto_basis"] / result["fuel_l_per_hour"]
+    assert ratio == pytest.approx(
+        1.0 / (result["traction_efficiency"] / 100.0 * TRANS_EFF_PCT / 100.0), rel=1e-9
+    )

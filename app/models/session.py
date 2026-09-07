@@ -4,11 +4,27 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, String, Text, UniqueConstraint, Uuid, text
+from decimal import Decimal
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from app.database import Base
+from app.models.mixins import uuid_server_default
 
 
 class OperationSession(Base):
@@ -22,13 +38,17 @@ class OperationSession(Base):
             "status IN ('active','paused','completed','aborted')",
             name="ck_sessions_status",
         ),
+        CheckConstraint(
+            "charge_unit IS NULL OR charge_unit IN ('per_ha','per_hour')",
+            name="ck_sessions_charge_unit",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
+        server_default=uuid_server_default(),
     )
     tractor_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -68,9 +88,28 @@ class OperationSession(Base):
     gps_tracking_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     area_ha: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     implement_width_m: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    total_cost_inr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    charge_per_ha_applied: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # --- Billing -----------------------------------------------------------------
+    # The rate and its unit are LOCKED at session start (see
+    # ``operation_cost_service.lock_session_rate``) so that a later edit to the owner's
+    # rate card cannot retroactively change a session's charge. ``charge_per_ha_applied``
+    # keeps its historical name for API compatibility but holds Rs/ha *or* Rs/hr --
+    # ``charge_unit`` is what says which.
+    charge_unit: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    rate_currency: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("'INR'"))
+    operation_charge_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("operation_charges.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    #: Worked hours net of paused intervals; only set for per-hour operations.
+    billable_hours: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_cost_inr: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+    charge_per_ha_applied: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4), nullable=True)
     cost_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: Non-NULL means the charge is final. Nothing may recompute it after this is set.
+    cost_finalized_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -112,6 +151,12 @@ class OperationSession(Base):
         back_populates="session",
         cascade="all, delete-orphan",
     )
+    pauses: Mapped[list["SessionPause"]] = relationship(
+        "SessionPause",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="SessionPause.paused_at",
+    )
     alerts: Mapped[list["IoTAlert"]] = relationship(
         "IoTAlert",
         back_populates="session",
@@ -135,6 +180,48 @@ class OperationSession(Base):
     )
 
 
+class SessionPause(Base):
+    """One paused interval of a session -- the ledger billing reads to exclude idle time.
+
+    A row is opened by ``PATCH /pause`` and closed by ``PATCH /resume``; ``stop`` and
+    ``cancel`` close any interval still open. ``resumed_at IS NULL`` therefore means
+    "paused right now", and for a terminated session an open row is closed at
+    ``ended_at``.
+
+    Two things read this: ``billable_hours`` subtracts the total paused duration for
+    Threshing/Grading, and ``field_area_service`` drops GPS points that fall inside these
+    windows so travel during a pause is not billed as worked hectares. Telemetry is still
+    *stored* while paused -- the map trail stays continuous -- it is only excluded from
+    the bill.
+    """
+
+    __tablename__ = "session_pauses"
+    __table_args__ = (
+        Index("ix_session_pauses_session_id", "session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=uuid_server_default(),
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    paused_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    session: Mapped["OperationSession"] = relationship("OperationSession", back_populates="pauses")
+
+
 class SessionPresetValue(Base):
     __tablename__ = "session_preset_values"
     __table_args__ = (
@@ -149,7 +236,7 @@ class SessionPresetValue(Base):
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
+        server_default=uuid_server_default(),
     )
     session_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -183,7 +270,7 @@ class IoTAlert(Base):
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
+        server_default=uuid_server_default(),
     )
     session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True),
@@ -228,7 +315,7 @@ class FieldObservation(Base):
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
+        server_default=uuid_server_default(),
     )
     session_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -269,7 +356,7 @@ class WageRecord(Base):
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
+        server_default=uuid_server_default(),
     )
     session_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -320,7 +407,7 @@ class FuelLog(Base):
         Uuid(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
+        server_default=uuid_server_default(),
     )
     tractor_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
